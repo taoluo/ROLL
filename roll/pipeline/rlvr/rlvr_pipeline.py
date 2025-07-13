@@ -369,6 +369,9 @@ class RLVRPipeline(BasePipeline):
                 ) as step_generate_timer:
                     domain_batches = {}
                     batch.meta_info["generation_config"] = self.actor_infer.worker_config.generating_args.to_dict()
+
+                    # Tao: To keep constant seed for determinsitic sampling
+                    batch.meta_info["generation_config"]['seed']  = 123
                     self.actor_infer.start_server(data=DataProto(meta_info=batch.meta_info))
                     for reward_cluster in self.rewards.values():
                         reward_cluster.load_states()

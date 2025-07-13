@@ -534,6 +534,10 @@ class DynamicSamplingScheduler:
                 self.actor_cluster.workers[0].add_request.remote(
                     command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": '1'})
                 )
+                # interrupt req 1 and 0
+                self.actor_cluster.workers[0].add_request.remote(
+                    command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": '0'})
+                )
                 last_interrupt_threshold_count = current_timeout_threshold_count
 
             if self.interrupted_query_group_buffers:
@@ -614,8 +618,8 @@ class DynamicSamplingScheduler:
                 response_length = 0
             
             logger.info(f"COLLECT_request_id={request_id}, original_id={original_request_id}, domain={domain}, is_continued={is_continued}, migrations={migration_count}, finish_status={finish_status}, response_length={response_length}")
-            logger.info(f"COLLECT_PROMPT_{request_id}: {prompt_text}")
-            logger.info(f"COLLECT_RESPONSE_{request_id}: {response_text}")
+            logger.info(f"COLLECT_PROMPT_{request_id}: \n{prompt_text}")
+            logger.info(f"COLLECT_RESPONSE_{request_id}: \n{response_text}")
         
         query_use_count = next(prompt_id_counter)
         logger.info(
