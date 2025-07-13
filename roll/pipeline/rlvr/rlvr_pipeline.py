@@ -34,6 +34,7 @@ from roll.utils.logging import get_logger
 from roll.utils.metrics.metrics_manager import MetricsManager
 
 logger = get_logger()
+test_sched = True
 
 
 def preprocess_dataset(dataset, prompt_len, encode_function, num_proc):
@@ -121,7 +122,8 @@ class RLVRPipeline(BasePipeline):
 
         print(f'load_dataset_paths: {chr(10)} {chr(10).join(dataset_paths)}')
         dataset = datasets.load_dataset('json', data_files=dataset_paths)['train']
-
+        print(f"dataset loaded: {dataset[:2]}")
+        # exit(0)
         self.val_dataset = None
         if self.pipeline_config.validation:
             val_dataset_paths = self.pipeline_config.validation.data_args.file_name
@@ -189,7 +191,7 @@ class RLVRPipeline(BasePipeline):
             worker_cls=self.pipeline_config.actor_train.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.actor_train,
-        )
+        ) if not test_sched else None
         self.actor_infer: Any = Cluster(
             name=self.pipeline_config.actor_infer.name,
             worker_cls=self.pipeline_config.actor_infer.worker_cls,
@@ -201,7 +203,7 @@ class RLVRPipeline(BasePipeline):
             worker_cls=self.pipeline_config.reference.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.reference,
-        )
+        ) if not test_sched else None
         if self.pipeline_config.adv_estimator == "gae":
             self.critic: Any = Cluster(
                 name=self.pipeline_config.critic.name,
@@ -231,6 +233,7 @@ class RLVRPipeline(BasePipeline):
                 domain_batch_size = int(domain_ratios[domain] * self.pipeline_config.rollout_batch_size)
             accumulated += domain_batch_size
             generate_scheduler = DynamicSamplingScheduler.options(
+                name=f"DynamicSamplingScheduler-{domain}",
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -251,14 +254,16 @@ class RLVRPipeline(BasePipeline):
             )
             self.generate_schedulers[domain] = generate_scheduler
             self.domain_batch_size[domain] = domain_batch_size
-
-            assert domain_batch_size < len(self.domain_datasets[domain]), (f"domain_batch_size {domain_batch_size} must be "
-                                                                           f"less than the number of domain datasets {len(self.domain_datasets[domain])}")
+            # skip for using fixed dataset item
+            # assert domain_batch_size < len(self.domain_datasets[domain]), (f"domain_batch_size {domain_batch_size} must be "
+            #                                                                f"less than the number of domain datasets {len(self.domain_datasets[domain])}")
 
         if self.val_dataset:
             val_pipeline_config = copy.deepcopy(self.pipeline_config)
             val_pipeline_config.use_additional_prompts = False
             self.val_generate_scheduler = DynamicSamplingScheduler.options(
+                name="DynamicSamplingScheduler-validation",
+
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -282,19 +287,23 @@ class RLVRPipeline(BasePipeline):
         refs.extend(self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
-        refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
+        if not test_sched:
+            refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
+
         refs = []
         for key, cluster in self.rewards.items():
             refs.extend(cluster.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
         refs: List[ray.ObjectRef] = []
-        refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
+        if not test_sched:
+            refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
         if self.pipeline_config.adv_estimator == "gae":
             refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
-        self.set_model_update_pair(
+        if not test_sched:
+            self.set_model_update_pair(
             src_cluster=self.actor_train,
             tgt_cluster=self.actor_infer,
             frequency=self.pipeline_config.actor_train.model_update_frequency,
@@ -303,7 +312,8 @@ class RLVRPipeline(BasePipeline):
         if self.pipeline_config.adv_estimator == "gae":
             self.set_checkpoint_clusters(self.actor_train, self.critic)
         else:
-            self.set_checkpoint_clusters(self.actor_train)
+            if not test_sched:
+                self.set_checkpoint_clusters(self.actor_train)
 
         self.running = {}
         for domain in self.rewards.keys():
@@ -333,14 +343,18 @@ class RLVRPipeline(BasePipeline):
                 # 先model update，resume时不需要保存infer cluster的状态
                 if self.pipeline_config.adv_estimator == "gae":
                     self.critic.offload_states(blocking=True)
-                self.actor_train.offload_states(blocking=True)
 
-                with Timer(name="step_model_update", logger=None) as step_model_update_timer:
-                    model_update_metrics: Dict = self.model_update(global_step)
-                    metrics_mgr.add_metrics(model_update_metrics)
-                metrics_mgr.add_metric("time/step_model_update", step_model_update_timer.last)
+                if not test_sched:
+                    self.actor_train.offload_states(blocking=True)
 
-                if self.val_dataset and global_step % self.pipeline_config.eval_steps == 0:
+                    with Timer(name="step_model_update", logger=None) as step_model_update_timer:
+                        model_update_metrics: Dict = self.model_update(global_step)
+                        metrics_mgr.add_metrics(model_update_metrics)
+                    metrics_mgr.add_metric("time/step_model_update", step_model_update_timer.last)
+
+
+                # if self.val_dataset and global_step % self.pipeline_config.eval_steps == 0:
+                if False:
                     with Timer(name="val_step", logger=None) as val_step_timer:
                         val_metrics = self.val()
                         metrics_mgr.add_metrics(val_metrics)
@@ -379,6 +393,13 @@ class RLVRPipeline(BasePipeline):
                 metrics_mgr.add_metric("time/step_generate", step_generate_timer.last)
 
                 batch = generate_output
+                
+
+
+                if test_sched:
+                    logger.info("test_sched is True, skip calculation of reference log_probs and old log_probs and training, exiting...")
+
+                    return
 
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_ref_log_probs_timer:
                     ref_log_probs = self.reference.compute_log_probs(batch, blocking=True)

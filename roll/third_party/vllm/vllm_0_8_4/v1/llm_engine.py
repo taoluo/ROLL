@@ -197,8 +197,11 @@ class LLMEngine084(LLMEngine):
         priority: int = 0,
     ) -> None:
         if isinstance(params, SamplingParams):
-            params.output_kind = RequestOutputKind.FINAL_ONLY
+            # (tao) use cumulative output for roll for collecting partial output
+            # params.output_kind = RequestOutputKind.FINAL_ONLY
+            params.output_kind = RequestOutputKind.CUMULATIVE
 
+            
         request = self.processor.custom_process_inputs(request_id, processed_inputs, params,
                                                 arrival_time, lora_request,
                                                 trace_headers,
@@ -211,9 +214,11 @@ class LLMEngine084(LLMEngine):
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, None, 0)
             # Add the request to EngineCore.
+            logger.info(f"added request to vllm engine {request=}")
             self.engine_core.add_request(request)
             return
 
+        assert False, "Tao assume not supported for now"
         # Fan out child requests (for n>1).
         parent_req = ParentRequest(request_id, params)
         for idx in range(n):

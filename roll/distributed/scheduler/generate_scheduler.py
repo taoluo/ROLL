@@ -28,7 +28,7 @@ from roll.utils.functionals import (
 )
 from roll.utils.logging import get_logger
 from roll.utils.multi_thread_utils import ThreadSafeDict
-
+from pprint import pprint
 logger = get_logger()
 
 
@@ -287,6 +287,7 @@ class GenerateScheduler:
             output=output_tensor,
             num_return_sequences=generate_return_num,
             sequence_length=self.pipeline_config.sequence_length,
+            canonical_prompt_length=self.pipeline_config.prompt_length,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
         )
@@ -333,7 +334,8 @@ class GenerateScheduler:
             self.is_completed = True
 
 
-@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
+# @ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
+@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 1})
 class DynamicSamplingScheduler:
 
     def __init__(self, pipeline_config=None):
@@ -388,6 +390,7 @@ class DynamicSamplingScheduler:
         self.running_prompts = 0
         self.response_cache: Dict[str, List] = None
         self.prompt_use_count = 0
+        self.postprocessed_requests_count = 0
 
     def set_scheduler(
         self,
@@ -441,6 +444,27 @@ class DynamicSamplingScheduler:
             namespace=RAY_NAMESPACE,
         ).remote()
 
+        import os
+        os.environ.setdefault("PYDEVD_USE_CYTHON", "NO")
+        os.environ.setdefault("PYDEVD_USE_FRAME_EVAL", "NO")
+        import pydevd_pycharm
+
+        # Differentiate schedulers by use_additional_prompts config
+        if hasattr(self.pipeline_config, 'use_additional_prompts') and not self.pipeline_config.use_additional_prompts:
+            # Validation scheduler (use_additional_prompts = False)
+            debug_port = 12346
+            scheduler_type = "VALIDATION"
+        else:
+            # Training scheduler (use_additional_prompts = True or default)
+            debug_port = 12344
+            scheduler_type = "TRAINING"
+            logger.info(f"Connecting PyCharm debugger on port {debug_port}")
+            if os.getenv("PYCHARM", "0") == "1":
+                pydevd_pycharm.settrace('localhost', port=debug_port, stdoutToServer=True, stderrToServer=True, suspend=False)
+            logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
+            print(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
+
+
     def reset_status(self):
         self.completed_buffers: Dict[int, List[DataProto]] = defaultdict(list)
         self.query_group_buffers: Dict[int, List[DataProto]] = defaultdict(list)
@@ -464,6 +488,8 @@ class DynamicSamplingScheduler:
             desc=f"{bar_name} generate progress(prompt)",
             mininterval=int(self.batch_size * 0.1) + 1,
         )
+        self.interrupted_query_group_buffers: Dict[int, List[DataProto]] = defaultdict(list)
+
 
     def get_batch(self, data: DataProto, batch_size: int) -> DataProto:
         """
@@ -477,6 +503,13 @@ class DynamicSamplingScheduler:
         prompt_id_counter = itertools.count()
         self.generation_config = copy.deepcopy(data.meta_info["generation_config"])
         num_return_sequences = self.generation_config["num_return_sequences"]
+        has_interrupted_any = False
+        enable_migration = True
+        # enable_migration = False
+        # interrupt_timeout_threshold = [ 2, 4, 6]
+        interrupt_timeout_threshold = [ 2, ]
+        last_interrupt_threshold_count = 0
+        start = time.time()
         while True:
             if (
                 sum([len(v) for v in list(self.completed_buffers.values())[:]])
@@ -486,17 +519,49 @@ class DynamicSamplingScheduler:
                 break
             self.check_worker_alive(self.actor_cluster)
             self.check_response_callback()
+
+
+            elapse_time = time.time() - start
+            current_timeout_threshold_count = sum([ elapse_time> threshold for threshold in interrupt_timeout_threshold])
+            # if enable_migration and (not has_interrupted_any) and self.postprocessed_requests_count > 0:
+            if enable_migration and  current_timeout_threshold_count > last_interrupt_threshold_count:
+                # todo if interrupted buffer >0, resend interrupted.
+                # logger.info(f"Migration: postprocessed_requests_count {self.postprocessed_requests_count} > 0, check if need to migrate interrupted query group buffers.")
+                logger.info(f"Migration: interrupt after {elapse_time=}sec {current_timeout_threshold_count=}")
+                # self.interrupt_all_requests_by_dp_rank(0)  # interrupt all even ranks
+                # has_interrupted_any = True
+                # interrupt req 0, keep req 1 for comparison
+                self.actor_cluster.workers[0].add_request.remote(
+                    command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": '1'})
+                )
+                last_interrupt_threshold_count = current_timeout_threshold_count
+
+            if self.interrupted_query_group_buffers:
+
+                # assert False,  f"Migration: Sending interrupted query group to DP rank {list(self.interrupted_query_group_buffers.keys())}"
+
+                target_dp_rank = next(self.get_available_dp_rank())
+
+                self.send_one_interrupted_query_group_to_dp_new(target_dp_rank)
+                logger.info(f"Migration: Sending interrupted query group to DP rank {target_dp_rank} and skip sending any new request.")
+
+                continue
+
             if not self.check_send_new_request():
                 time.sleep(1)
                 continue
 
             # get a query from dataset
             prompt_id = next(prompt_id_counter)
-            dataset_item = self.get_next_dataset_item()
+            dataset_item = self.get_fixed_dataset_item(0)  # Use fixed dataset item for testing
+            # dataset_item = self.get_next_dataset_item()  # Use different dataset items
+            # tao: rvst hardcode for testing debug interrupt, remove this later
+            # dataset_item = self.get_fixed_dataset_item(0)  # This was causing identical input_ids!
+            
             domain = dataset_item.get("domain", "default")
             collect_data = self.collect_fn([dataset_item])
             request_data: DataProto = DataProto.from_single_dict(collect_data, meta_info=data.meta_info)
-
+            
             # replica, redundancy
             request_data_list = self.expand_requests(request_data)
 
@@ -524,12 +589,41 @@ class DynamicSamplingScheduler:
 
         completed_buffers = {k: v for k, v in self.completed_buffers.items() if len(v) > 0}
         collect_data = [item for sublist in list(completed_buffers.values())[:] for item in sublist]
+        
+        # **LOG ALL INDIVIDUAL REQUESTS**: Before concatenation, log each request's detailed info
+        logger.info(f"SCHEDULER_COLLECT_DATA: Found {len(collect_data)} total responses from {len(completed_buffers)} queries")
+        for i, data_item in enumerate(collect_data):
+            request_id = data_item.meta_info.get("request_id", f"unknown_{i}")
+            finish_status = data_item.meta_info.get("finish_status", "UNKNOWN")
+            is_continued = data_item.meta_info.get("is_continued_request", False)
+            migration_count = data_item.meta_info.get("migration_count", 0)
+            original_request_id = data_item.meta_info.get("original_request_id", request_id)
+            domain = data_item.non_tensor_batch.get("domain", ["UNKNOWN"])[0] if "domain" in data_item.non_tensor_batch else "UNKNOWN"
+            
+            # Decode prompt and response for logging
+            if "prompts" in data_item.batch:
+                prompt_text = self.tokenizer.decode(data_item.batch["prompts"][0], skip_special_tokens=True)
+            else:
+                prompt_text = "NO_PROMPT_IN_BATCH"
+            
+            if "responses" in data_item.batch:
+                response_text = self.tokenizer.decode(data_item.batch["responses"][0], skip_special_tokens=True)
+                response_length = len(data_item.batch["responses"][0])
+            else:
+                response_text = "NO_RESPONSE_IN_BATCH"
+                response_length = 0
+            
+            logger.info(f"COLLECT_request_id={request_id}, original_id={original_request_id}, domain={domain}, is_continued={is_continued}, migrations={migration_count}, finish_status={finish_status}, response_length={response_length}")
+            logger.info(f"COLLECT_PROMPT_{request_id}: {prompt_text}")
+            logger.info(f"COLLECT_RESPONSE_{request_id}: {response_text}")
+        
         query_use_count = next(prompt_id_counter)
         logger.info(
             f"total collect data: {len(collect_data)}, collect queries: {len(completed_buffers)} "
             f"used queries: {query_use_count}  query_filter_count: {self.query_filter_count} "
             f"response_filter_count: {self.response_filter_count}"
         )
+
         # TODO: 这里 len(collect_data) > rollout_batch_size, 可以尝试动态扩大batch_size
         batch = DataProto.concat(collect_data[: self.batch_size * num_return_sequences])
         batch.meta_info["metrics"] = {
@@ -553,25 +647,432 @@ class DynamicSamplingScheduler:
 
         return batch
 
+    def send_one_interrupted_query_group_to_dp_new(self, target_dp_rank: int):
+        """
+        Send interrupted query group to a target DP rank for continuation.
+        Enhanced to handle multiple interruptions/migrations by tracking original prompt length
+        and cumulative partial output length.
+        """
+        with self.lock:
+            assert self.interrupted_query_group_buffers, "Migration: No interrupted query groups in buffer to migrate"
+
+            prompt_id, interrupted_batches = self.interrupted_query_group_buffers.popitem()
+            assert len(interrupted_batches) > 0, f"Migration: Empty interrupted batches for prompt_id {prompt_id}"
+
+            # --- AGGREGATE ALL PARTIAL OUTPUTS ---
+            # The core fix is to process all partial outputs for a request together,
+            # not individually in a loop.
+
+            # 1. Get the original request details from the first interrupted batch.
+            #    All batches for a prompt_id share the same original request.
+            first_batch = interrupted_batches[0]
+            original_request_id = first_batch.meta_info["request_id"]
+            assert original_request_id in self.requests_buffers, f"Original request not found for {original_request_id}"
+            original_request = self.requests_buffers[original_request_id]
+            original_prompt_ids = original_request.batch["input_ids"]
+            original_attention_mask = original_request.batch["attention_mask"]
+            original_prompt_length = original_attention_mask.sum().item()
+
+            # 2. Concatenate all partial token chunks from all interruptions.
+            all_partial_tokens = []
+            for batch in interrupted_batches:
+                partial_tokens = batch.meta_info.get("output_token_ids", [])
+                if partial_tokens and len(partial_tokens) > 0 and len(partial_tokens[0]) > 0:
+                    all_partial_tokens.extend(partial_tokens[0])
+            
+            cumulative_partial_output_length = len(all_partial_tokens)
+
+            # 3. Build the new, fully continued input.
+            if cumulative_partial_output_length > 0:
+                partial_output_tensor = torch.tensor(all_partial_tokens, device=original_prompt_ids.device)
+                continued_input_ids = torch.cat([original_prompt_ids.squeeze(0), partial_output_tensor], dim=0).unsqueeze(0)
+                
+                # Extend the attention mask to cover the new tokens.
+                partial_output_mask = torch.ones((1, cumulative_partial_output_length), device=original_prompt_ids.device, dtype=torch.long)
+                continued_attention_mask = torch.cat([original_attention_mask, partial_output_mask], dim=1)
+            else:
+                # No new tokens, resubmit the original prompt.
+                continued_input_ids = original_prompt_ids
+                continued_attention_mask = original_attention_mask
+
+            continued_position_ids = torch.arange(continued_input_ids.shape[1], device=continued_input_ids.device).unsqueeze(0)
+            
+            # --- NEW ASSERTIONS to validate the fix ---
+            expected_total_length = original_prompt_length + cumulative_partial_output_length
+            actual_total_length = continued_attention_mask.sum().item()
+            assert actual_total_length == expected_total_length, \
+                f"Assertion Failed: Reconstructed length mismatch. Expected {expected_total_length}, got {actual_total_length}"
+            assert continued_input_ids.shape[1] == continued_attention_mask.shape[1], \
+                f"Assertion Failed: Mismatch between input_ids shape ({continued_input_ids.shape[1]}) and attention_mask shape ({continued_attention_mask.shape[1]})"
+
+            # 4. Create the single new migrated request.
+            #    Use metadata from the *last* interrupted batch as it's the most recent.
+            last_batch = interrupted_batches[-1]
+            migrated_request = DataProto()
+            
+            batch_tensors = {
+                    "input_ids": continued_input_ids,
+                    "attention_mask": continued_attention_mask,
+                    "position_ids": continued_position_ids,
+                }
+                # Copy other tensor fields from the original request
+            for key in original_request.batch.keys():
+                if key not in batch_tensors:
+                    batch_tensors[key] = original_request.batch[key]
+            
+            migrated_request.batch = TensorDict(source=batch_tensors, batch_size=[1])
+            migrated_request.non_tensor_batch = copy.deepcopy(original_request.non_tensor_batch)
+
+            migrated_request.meta_info = last_batch.meta_info.copy()
+            migrated_request.meta_info.pop('finish_status', None)
+            migrated_request.meta_info["response_callback_fn"] = self.response_callback_fn
+            migrated_request.meta_info["is_continued_request"] = True
+            migrated_request.meta_info["original_prompt_length"] = original_prompt_length
+            migrated_request.meta_info["cumulative_partial_output_length"] = cumulative_partial_output_length
+            migrated_request.meta_info["migration_count"] = len(interrupted_batches)
+
+            # Adjust max_new_tokens for the continued generation.
+            generation_config = migrated_request.meta_info["generation_config"].copy()
+            max_sequence_length = self.pipeline_config.sequence_length
+            safety_buffer = 4
+            max_allowed_new_tokens = max(1, max_sequence_length - actual_total_length - safety_buffer)
+            original_max_new_tokens = generation_config.get("max_new_tokens", 512)
+            generation_config["max_new_tokens"] = min(original_max_new_tokens, max_allowed_new_tokens)
+            migrated_request.meta_info["generation_config"] = generation_config
+                
+            # Reuse the original request ID for the resumed request.
+            migrated_request.meta_info["request_id"] = original_request_id
+
+            # Update the buffers and mappings with the new state for the original request ID.
+            self.requests_buffers[original_request_id] = migrated_request
+            self.request_id_2_prompt_id[original_request_id] = prompt_id
+            self.request_id_2_dp_rank[original_request_id] = target_dp_rank
+            # The original_request_id should already be in self.prompt_id_2_request_ids, so no need to re-add.
+
+            ray.get(self.actor_cluster.workers[target_dp_rank].add_request.remote(command=GenerateRequestType.ADD,
+                                                                             data=migrated_request))
+            self.load_balance_coordinator[target_dp_rank] += 1
+            logger.info(
+                f"Successfully resumed prompt {prompt_id} to dp rank {target_dp_rank} with original request id {original_request_id}"
+            )
+
+    def send_one_interrupted_query_group_to_dp(self, target_dp_rank: int):
+        """
+        Send interrupted query group to a target DP rank for continuation.
+        This method resends interrupted requests with their original input + partial output
+        concatenated as the new input, allowing the model to continue generation from
+        where it was interrupted while preserving the original request_id and metadata.
+        """
+        # assert False, "reroute not working now"
+        with self.lock:
+            # 1. get the request outputs from the interrupted buffer for one prompt
+            assert self.interrupted_query_group_buffers, "Migration: No interrupted query groups in buffer to migrate"
+
+            prompt_id, interrupted_batches = self.interrupted_query_group_buffers.popitem()
+            logger.info(
+                f"Migration: Migrating prompt_id {prompt_id} with {len(interrupted_batches)} batches to DP rank {target_dp_rank}")
+
+            old_dp_rank = None  # Initialize to track the original DP rank
+            successfully_migrated = 0  # Count successfully migrated requests
+
+            for i, processed_batch in enumerate(interrupted_batches):
+                pprint(processed_batch)
+                assert processed_batch.meta_info[
+                           "finish_status"] == "interrupted", "interrupted_batches should be interrupted"
+                # Keep the original request_id
+                original_request_id = processed_batch.meta_info["request_id"]
+
+                # Create migrated request with same request_id
+                migrated_request = DataProto()
+
+                # CRITICAL: For interrupted requests, we must build the continuation input correctly
+                # by reconstructing from the original input + partial output tokens.
+
+                # Get the original request to extract the original input_ids
+                if original_request_id not in self.requests_buffers:
+                    # Original request not found - skip this migration
+                    logger.error(f"Migration: Original request not found for {original_request_id}, skipping migration")
+                    assert False, f"Original request not found for {original_request_id}, skipping migration"
+
+
+                original_request = self.requests_buffers[original_request_id]
+                original_input_ids = original_request.batch["input_ids"]  # Original prompt tokens
+                logger.info(
+                    f"Migration: Found original request for {original_request_id}, input_shape={original_input_ids.shape}")
+
+                # Get partial output tokens from the processed response
+                partial_output_tokens = processed_batch.meta_info.get("output_token_ids", [])
+
+                if partial_output_tokens and len(partial_output_tokens) > 0 and len(partial_output_tokens[0]) > 0:
+                    # We have partial output, concatenate original input + partial output for continuation
+                    logger.info(
+                        f"Migration: Found partial output tokens for {original_request_id}: {len(partial_output_tokens[0])} tokens")
+
+                    # Build continuation input: original_input + partial_output
+                    partial_output_tensor = torch.tensor(partial_output_tokens[0], device=original_input_ids.device)
+                    continued_input_ids = torch.cat([original_input_ids.squeeze(0), partial_output_tensor],
+                                                    dim=0).unsqueeze(0)
+
+                    # Build corresponding attention mask and position_ids
+                    continued_seq_len = continued_input_ids.shape[1]
+                    continued_attention_mask = torch.ones((1, continued_seq_len), device=continued_input_ids.device,
+                                                          dtype=torch.long)
+                    continued_position_ids = torch.arange(continued_seq_len,
+                                                          device=continued_input_ids.device).unsqueeze(0)
+
+                    logger.info(f"Migration: Built continuation input for {original_request_id}: "
+                                f"original_len={original_input_ids.shape[1]}, partial_len={len(partial_output_tokens[0])}, "
+                                f"continued_len={continued_seq_len}")
+                    
+                    # **CRITICAL FIX**: Store the original prompt length for correct prompt extraction
+                    # This ensures postprocess_generate knows how to extract the original prompt correctly
+                    original_prompt_length = original_input_ids.shape[1]
+                    
+                else:
+                    # No partial output, just use original input
+                    logger.warning(
+                        f"Migration: No partial output found for interrupted request {original_request_id}, using original input")
+                    continued_input_ids = original_input_ids
+
+                    continued_attention_mask = original_request.batch["attention_mask"]
+                    continued_position_ids = original_request.batch.get("position_ids",
+                                                                        torch.arange(continued_input_ids.shape[1],
+                                                                                     device=continued_input_ids.device).unsqueeze(
+                                                                            0))
+                    original_prompt_length = original_input_ids.shape[1]
+
+                logger.info(f"Migration: Using continued input for request {original_request_id}: "
+                            f"continued_input_shape={continued_input_ids.shape}, max_token_id={continued_input_ids.max().item()}")
+
+                batch_tensors = {
+                    "input_ids": continued_input_ids,  # Original input + partial output for continuation
+                    "attention_mask": continued_attention_mask,
+                    "position_ids": continued_position_ids,
+                }
+
+                # Copy other tensor fields from the original request
+                source_batch = original_request.batch
+                for key in source_batch.keys():
+                    if key not in batch_tensors and key not in ["prompts"]:
+                        batch_tensors[key] = source_batch[key]
+                        logger.info(f"Migration: Copied tensor field '{key}' from original request.")
+
+                # **CRITICAL FIX**: Create a special "prompts" tensor that contains ONLY the original prompt
+                # This ensures consistent tensor shapes across normal and interrupted requests
+                batch_tensors["prompts"] = original_input_ids
+                logger.info(f"Migration: Set prompts tensor to original shape {original_input_ids.shape} for consistency")
+
+                # Create TensorDict
+                migrated_request.batch = TensorDict(source=batch_tensors, batch_size=(continued_input_ids.shape[0],))
+
+                # **FIX: Use original request's non_tensor_batch instead of processed_batch**
+                # The processed_batch might have incomplete or modified non_tensor_batch data
+                migrated_request.non_tensor_batch = copy.deepcopy(original_request.non_tensor_batch)
+
+                # Verify that the domain key exists in the original request
+                if "domain" not in original_request.non_tensor_batch:
+                    logger.error(f"Migration: 'domain' key missing in original request {original_request_id}")
+                    logger.error(
+                        f"Migration: Original request non_tensor_batch keys: {list(original_request.non_tensor_batch.keys())}")
+                    assert False, f"'domain' key missing in original request {original_request_id}"
+
+                logger.info(
+                    f"Migration: Copied non_tensor_batch from original request. Keys: {list(migrated_request.non_tensor_batch.keys())}")
+
+                # Keep original metadata but update callback and adjust generation config
+                assert processed_batch.meta_info['finish_status'] == "interrupted"
+                migrated_request.meta_info = processed_batch.meta_info.copy()
+                migrated_request.meta_info.pop('finish_status', None)
+                migrated_request.meta_info["response_callback_fn"] = self.response_callback_fn
+                
+                # **CRITICAL FIX**: Store metadata for postprocess_generate to handle correctly
+                migrated_request.meta_info["is_continued_request"] = True
+                migrated_request.meta_info["original_prompt_length"] = original_prompt_length
+                migrated_request.meta_info["partial_output_length"] = len(partial_output_tokens[0]) if partial_output_tokens and len(partial_output_tokens) > 0 and len(partial_output_tokens[0]) > 0 else 0
+
+                # Adjust max_new_tokens for continued generation
+                generation_config = migrated_request.meta_info["generation_config"].copy()
+                current_input_length = continued_input_ids.shape[1]
+                max_sequence_length = self.pipeline_config.sequence_length
+                safety_buffer = 4
+                max_allowed_new_tokens = max_sequence_length - current_input_length - safety_buffer
+                original_max_new_tokens = generation_config.get("max_new_tokens", 512)
+                adjusted_max_new_tokens = max(1, min(original_max_new_tokens, max_allowed_new_tokens))
+                generation_config["max_new_tokens"] = adjusted_max_new_tokens
+                migrated_request.meta_info["generation_config"] = generation_config
+                logger.info(f"Migration: max_new_tokens for request {original_request_id}: "
+                            f"original={original_max_new_tokens}, adjusted={adjusted_max_new_tokens}")
+
+                migrated_request.non_tensor_batch = processed_batch.non_tensor_batch.copy()
+                assert "domain" in processed_batch.non_tensor_batch.keys(), f"{prompt_id=} {original_request_id=} processed_batch.non_tensor_batch keys: {list(processed_batch.non_tensor_batch.keys())} should contain domain"
+                assert "domain" in migrated_request.non_tensor_batch.keys(), f"{prompt_id=} {original_request_id=} batch.non_tensor_batch keys: {list(migrated_request.non_tensor_batch.keys())} should contain domain"
+
+                # Update bookkeeping data structures
+
+                old_dp_rank = self.request_id_2_dp_rank[original_request_id]
+                self.request_id_2_dp_rank[original_request_id] = target_dp_rank
+                self.load_balance_coordinator[target_dp_rank] += 1
+                self.requests_buffers[original_request_id] = migrated_request
+                logger.info(f"Migration: Added migrated request {original_request_id} to DP rank {target_dp_rank}")
+                # Send to new DP worker
+                self.actor_cluster.workers[target_dp_rank].add_request.remote(
+                    command=GenerateRequestType.ADD, data=migrated_request
+                )
+
+                migrated_request.meta_info.pop("response_callback_fn", None)
+                successfully_migrated += 1
+
+            if successfully_migrated == 0:
+                logger.error(f"Migration: Failed to migrate any requests for prompt_id {prompt_id} - all were skipped.")
+                assert False, "Failed to migrate any requests for prompt_id {prompt_id} - all were skipped."
+                return 0
+
+            logger.info(
+                f"Migration: Successfully migrated {successfully_migrated} out of {len(interrupted_batches)} requests for prompt_id {prompt_id} from rank {old_dp_rank} to rank {target_dp_rank}")
+            return successfully_migrated
+
+    def interrupt_all_requests_by_dp_rank(self, interrupted_rank):
+        # assert False, "Migration: interrupt_all_requests_by_dp_rank is not implemented yet"
+        # return
+        # 1. remove the interrupted rank from the active dp ranks
+        logger.info(f"Migration: Removing DP rank {interrupted_rank} from ready ranks")
+        # self.ready_dp_ranks.remove(interrupted_rank)
+
+        # some might be interrupted, some might be aborted or interrupted_rank
+        request_ids = self.get_running_request_ids_for_dp_rank(interrupted_rank)
+        assert len(request_ids) > 0, "no requests are informed interruption"
+        logger.info(
+            f"Migration: inform interrupting {len(request_ids)} requests from DP rank {interrupted_rank}  request list: {request_ids} ")
+        interrupt_refs = []
+
+        for request_id in request_ids:
+            # dp_rank = self.request_id_2_dp_rank[request_id]
+            interrupt_refs.append(
+                self.actor_cluster.workers[interrupted_rank].add_request.remote(
+                    command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": request_id})
+                )
+            )
+
+    def get_running_request_ids_for_dp_rank(self, target_dp_rank: int) -> List[str]:
+        """Get all request_ids currently assigned to a specific DP rank"""
+        running_request_ids = []
+        with self.lock:
+            for request_id in self.requests_buffers.keys():
+                if self.request_id_2_dp_rank[request_id] == target_dp_rank:
+                    running_request_ids.append(request_id)
+
+        return running_request_ids
+
     @ray.method(concurrency_group="multi_thread")
     def report_response(self, data: DataProto):
         """
         这里需要考虑多线程数据访问
         data 返回可能有多条的
         """
+
+        import pydevd_pycharm
+
+
         try:
+            logger.info(f"report_response: {data.meta_info['request_id']} {data.meta_info['finish_status']}")
             request_id = data.meta_info["request_id"]
+            # if request_id == '5':
+            # if False:
+            #     pydevd_pycharm.settrace(
+            #         'localhost',
+            #         port=12332,
+            #         stdoutToServer=True,
+            #         stderrToServer=True,
+            #         suspend=False,
+            #         trace_only_current_thread=True
+            #     )
+            # else:
+            #     # pydevd_pycharm.settrace(
+            #     #     'localhost',
+            #     #     port=9999,
+            #     #     stdoutToServer=True,
+            #     #     stderrToServer=True,
+            #     #     suspend=False,
+            #     #     trace_only_current_thread=True
+            #     # )
+            #
+            #     while True:
+            #         pass
+
             prompt_id = self.request_id_2_prompt_id[request_id]
             num_return_sequences = self.generation_config["num_return_sequences"]
+            assert data.meta_info["finish_status"] in ["interrupted", 'finished']
+            with self.lock:
+                if data.meta_info["finish_status"] == "interrupted":
+                    # **ENHANCED LOGGING**: Track prompt length and output lengths for interrupted requests
+                    
+                    # Get the original request to analyze lengths
+                    original_request = self.requests_buffers.get(request_id, None)
+                    original_prompt_length = 0
+                    cumulative_partial_output_length = 0
+                    migration_count = 0
+                    
+                    if original_request:
+                        original_input_ids = original_request.batch["input_ids"]
+                        concatenated_input_length = original_input_ids.shape[1]
+                        
+                        # Check if this is a continued request
+                        is_continued_request = original_request.meta_info.get("is_continued_request", False)
+                        if is_continued_request:
+                            # For continued requests, get the actual original prompt length from metadata
+                            original_prompt_length = original_request.meta_info.get("original_prompt_length", 1024)
+                            cumulative_partial_output_length = original_request.meta_info.get("cumulative_partial_output_length", 0)
+                            migration_count = original_request.meta_info.get("migration_count", 0)
+                        else:
+                            # For original requests, the input length is the original prompt length
+                            original_prompt_length = concatenated_input_length
+                    
+                    # Get the newly generated output tokens from this interruption
+                    output_token_ids = data.meta_info.get("output_token_ids", [])
+                    newly_generated_length = 0
+                    if output_token_ids and len(output_token_ids) > 0 and len(output_token_ids[0]) > 0:
+                        newly_generated_length = len(output_token_ids[0])
+                    
+                    # Single comprehensive log entry
+                    logger.info(f"Migration: BUFFERING interrupted request {request_id}: "
+                               f"original_prompt_length={original_prompt_length}, "
+                               f"cumulative_partial_output_length={cumulative_partial_output_length}, "
+                               f"newly_generated_length={newly_generated_length}, "
+                               f"migration_count={migration_count}")
+                    
+                    self.interrupted_query_group_buffers[prompt_id].append(data)
+                    logger.info(
+                        f"Migration: Added interrupted batch for prompt_id {prompt_id} to buffer {list(self.interrupted_query_group_buffers.keys())}")
+                    # assert False, "can interrupt and buffer the response, but not complete it yet"
+                    self.load_balance_coordinator[self.request_id_2_dp_rank[request_id]] -= 1
+                    return
 
+            assert data.meta_info["finish_status"] ==  "finished"
+
+            # with lock
             batch = self.postprocess_output_ids(data)
             output_count = batch.batch.batch_size[0]
+
             with self.lock:
                 self.load_balance_coordinator[self.request_id_2_dp_rank[request_id]] -= 1
                 self.prompt_id_2_request_ids[prompt_id].remove(request_id)
                 domain = "default"
+                assert "domain" in batch.non_tensor_batch.keys(), f"{prompt_id=} {request_id=} batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())} should contain domain"
+
                 if "domain" in batch.non_tensor_batch.keys():
                     domain = batch.non_tensor_batch["domain"][0]
+
+                logger.info(
+                    f"{request_id=} batch.non_tensor_batch: {list(batch.non_tensor_batch.keys())} self.reward_worker_iters {list(self.reward_worker_iters.keys())}")
+
+                if domain == "default":
+                    import pydevd_pycharm
+                    import os
+                    if os.getenv("PYCHARM", "0") == "1":
+                        pydevd_pycharm.settrace('localhost', port=12332, stdoutToServer=True, stderrToServer=True,
+                                            suspend=False)
+                    assert False, f"batch.non_tensor_batch : {list(batch.non_tensor_batch.keys())} self.reward_worker_iters {list(self.reward_worker_iters.keys())}"
+
                 reward_worker = next(self.reward_worker_iters[domain])
 
             if not self.running:
@@ -628,6 +1129,26 @@ class DynamicSamplingScheduler:
         except Exception as e:
             self.exception_queue.put(e)
 
+        pydevd_pycharm.stoptrace()
+
+    def get_fixed_dataset_item(self, dataset_index=0):
+        """Fixed dataset item for testing - always returns the same item"""
+        dataset_item = self.dataset[dataset_index]
+        logger.info(f"FIXED_DATASET_DEBUG: Using fixed dataset item at index {dataset_index}")
+        
+        # Log the fixed dataset item details
+        for key in ['prompt', 'text', 'messages', 'ground_truth', 'input_ids']:
+            if key in dataset_item:
+
+                data = dataset_item[key]
+                if key == 'input_ids':
+                    logger.info(f"FIXED_DATASET_DEBUG: {key}_len={len(data)}, first_10={data[:10]}")
+                else:
+                    sample_text = str(data)[:100] if data else "None"
+                    logger.info(f"FIXED_DATASET_DEBUG: {key}_sample='{sample_text}'")
+        
+        return dataset_item
+
     def get_next_dataset_item(self):
         if self.dataset_iter is None:
             random.seed(self.pipeline_config.seed + self.dataset_epoch)
@@ -636,7 +1157,13 @@ class DynamicSamplingScheduler:
             logger.info(f"{'-'.join(self.reward_clusters.keys())} dataset epoch: {self.dataset_epoch}")
 
         try:
-            dataset_item = self.dataset[next(self.dataset_iter)]
+            item_index = next(self.dataset_iter)
+            logger.info(f"Dataset length: {len(self.dataset)}, retrieving get_next_dataset_item at index: {item_index}")
+            dataset_item = self.dataset[item_index]
+            
+            # dataset_item = self.dataset[next(self.dataset_iter)]
+            # tao: rvst hardcode for testing debug interrupt, remove this later
+            # dataset_item = self.dataset[0]
         except StopIteration:
             self.dataset_epoch += 1
             random.seed(self.pipeline_config.seed + self.dataset_epoch)
@@ -665,8 +1192,10 @@ class DynamicSamplingScheduler:
     def postprocess_output_ids(self, data: DataProto) -> DataProto:
         # postprocess_generate, input_ids, attention_mask, left pad
         request_id = data.meta_info["request_id"]
-        request: DataProto = self.requests_buffers.pop(request_id)
-
+        logger.info(f"postprocess_output_ids: {request_id=}")
+        with self.lock:
+            request: DataProto = self.requests_buffers.pop(request_id)
+            self.postprocessed_requests_count +=1
         eos_token_id = data.meta_info["eos_token_id"]
         pad_token_id = data.meta_info["pad_token_id"]
         output_token_ids = data.meta_info["output_token_ids"]
@@ -680,6 +1209,7 @@ class DynamicSamplingScheduler:
             output=output_tensor,
             num_return_sequences=len(output_tokens),
             sequence_length=self.pipeline_config.sequence_length,
+            canonical_prompt_length=self.pipeline_config.prompt_length,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
         )
@@ -809,16 +1339,168 @@ class RequestScheduler:
 
     @ray.method(concurrency_group="multi_thread")
     def report_response(self, data: DataProto):
-        self.request_dict.set(data.meta_info["request_id"], data)
+        """
+        这里需要考虑多线程数据访问
+        data 返回可能有多条的
+        """
 
-    @ray.method(concurrency_group="multi_thread")
-    def abort_request(self, data: DataProto):
-        request_id = data.meta_info["request_id"]
-        if request_id in self.request_id_2_dp_rank:
-            infer_worker = self.infer_cluster.workers[self.request_id_2_dp_rank[request_id]]
-            ray.get(
-                infer_worker.add_request.remote(
-                    command=GenerateRequestType.ABORT, data=DataProto(meta_info={"request_id": request_id})
-                )
-            )
-            self.request_dict.set(request_id, None)
+        import pydevd_pycharm
+
+
+        try:
+            logger.info(f"report_response: {data.meta_info['request_id']} {data.meta_info['finish_status']}")
+            request_id = data.meta_info["request_id"]
+            # if request_id == '5':
+            # if False:
+            #     pydevd_pycharm.settrace(
+            #         'localhost',
+            #         port=12332,
+            #         stdoutToServer=True,
+            #         stderrToServer=True,
+            #         suspend=False,
+            #         trace_only_current_thread=True
+            #     )
+            # else:
+            #     # pydevd_pycharm.settrace(
+            #     #     'localhost',
+            #     #     port=9999,
+            #     #     stdoutToServer=True,
+            #     #     stderrToServer=True,
+            #     #     suspend=False,
+            #     #     trace_only_current_thread=True
+            #     # )
+            #
+            #     while True:
+            #         pass
+
+            prompt_id = self.request_id_2_prompt_id[request_id]
+            num_return_sequences = self.generation_config["num_return_sequences"]
+            assert data.meta_info["finish_status"] in ["interrupted", 'finished']
+            with self.lock:
+                if data.meta_info["finish_status"] == "interrupted":
+                    # **ENHANCED LOGGING**: Track prompt length and output lengths for interrupted requests
+                    
+                    # Get the original request to analyze lengths
+                    original_request = self.requests_buffers.get(request_id, None)
+                    original_prompt_length = 0
+                    cumulative_partial_output_length = 0
+                    migration_count = 0
+                    
+                    if original_request:
+                        original_input_ids = original_request.batch["input_ids"]
+                        concatenated_input_length = original_input_ids.shape[1]
+                        
+                        # Check if this is a continued request
+                        is_continued_request = original_request.meta_info.get("is_continued_request", False)
+                        if is_continued_request:
+                            # For continued requests, get the actual original prompt length from metadata
+                            original_prompt_length = original_request.meta_info.get("original_prompt_length", 1024)
+                            cumulative_partial_output_length = original_request.meta_info.get("cumulative_partial_output_length", 0)
+                            migration_count = original_request.meta_info.get("migration_count", 0)
+                        else:
+                            # For original requests, the input length is the original prompt length
+                            original_prompt_length = concatenated_input_length
+                    
+                    # Get the newly generated output tokens from this interruption
+                    output_token_ids = data.meta_info.get("output_token_ids", [])
+                    newly_generated_length = 0
+                    if output_token_ids and len(output_token_ids) > 0 and len(output_token_ids[0]) > 0:
+                        newly_generated_length = len(output_token_ids[0])
+                    
+                    # Single comprehensive log entry
+                    logger.info(f"Migration: BUFFERING interrupted request {request_id}: "
+                               f"original_prompt_length={original_prompt_length}, "
+                               f"cumulative_partial_output_length={cumulative_partial_output_length}, "
+                               f"newly_generated_length={newly_generated_length}, "
+                               f"migration_count={migration_count}")
+                    
+                    self.interrupted_query_group_buffers[prompt_id].append(data)
+                    logger.info(
+                        f"Migration: Added interrupted batch for prompt_id {prompt_id} to buffer {list(self.interrupted_query_group_buffers.keys())}")
+                    # assert False, "can interrupt and buffer the response, but not complete it yet"
+                    self.load_balance_coordinator[self.request_id_2_dp_rank[request_id]] -= 1
+                    return
+
+            assert data.meta_info["finish_status"] ==  "finished"
+
+            # with lock
+            batch = self.postprocess_output_ids(data)
+            output_count = batch.batch.batch_size[0]
+
+            with self.lock:
+                self.load_balance_coordinator[self.request_id_2_dp_rank[request_id]] -= 1
+                self.prompt_id_2_request_ids[prompt_id].remove(request_id)
+                domain = "default"
+                assert "domain" in batch.non_tensor_batch.keys(), f"{prompt_id=} {request_id=} batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())} should contain domain"
+
+                if "domain" in batch.non_tensor_batch.keys():
+                    domain = batch.non_tensor_batch["domain"][0]
+
+                logger.info(
+                    f"{request_id=} batch.non_tensor_batch: {list(batch.non_tensor_batch.keys())} self.reward_worker_iters {list(self.reward_worker_iters.keys())}")
+
+                if domain == "default":
+                    import pydevd_pycharm
+                    import os
+                    if os.getenv("PYCHARM", "0") == "1":
+                        pydevd_pycharm.settrace('localhost', port=12332, stdoutToServer=True, stderrToServer=True,
+                                            suspend=False)
+                    assert False, f"batch.non_tensor_batch : {list(batch.non_tensor_batch.keys())} self.reward_worker_iters {list(self.reward_worker_iters.keys())}"
+
+                reward_worker = next(self.reward_worker_iters[domain])
+
+            if not self.running:
+                return
+
+            # call reward
+            # reward worker得能支持单条数据计算, dynamic sampling对需要batch计算reward的需要注意...
+            # 多域的时候,llm as judge, 需要单独为reward worker分配gpu
+            rewards: DataProto = ray.get(reward_worker.compute_rewards.remote(batch))
+            batch.union(rewards)
+
+            response_buffers: List[DataProto] = []
+            batch_expanded = [batch[[idx]] for idx in range(output_count)]
+
+            # response_filter, 不太需要response filter
+            for batch_item in batch_expanded:
+                if self.response_filter_fn(batch_item, self.pipeline_config):
+                    response_buffers.append(batch_item)
+                else:
+                    self.response_filter_count += 1
+
+            with self.lock:
+                self.response_cache[domain].extend(batch_expanded)
+
+                if len(response_buffers) == 0:
+                    if len(self.prompt_id_2_request_ids[prompt_id]) == 0:
+                        self.running_prompts -= 1
+                    return
+
+                if len(self.completed_buffers[prompt_id]) > 0:
+                    return
+
+                # expand batch to response
+                self.query_group_buffers[prompt_id].extend(response_buffers)
+
+                # query_filter, query has n responses
+                if len(self.query_group_buffers[prompt_id]) >= num_return_sequences:
+                    if not self.query_filter_fn(self.query_group_buffers[prompt_id], self.pipeline_config):
+                        self.query_filter_count += 1
+                        del self.query_group_buffers[prompt_id]
+                        self.abort_requests(self.prompt_id_2_request_ids[prompt_id])
+                        return
+
+                    assert len(self.query_group_buffers[prompt_id]) >= num_return_sequences, (
+                        f"expect to generate {num_return_sequences} results from one prompt, "
+                        f"but get {len(self.query_group_buffers[prompt_id])}."
+                    )
+
+                    self.completed_buffers[prompt_id] = self.query_group_buffers[prompt_id][:num_return_sequences]
+                    self.progress_bar.update()
+
+                    # abort uncompleted request
+                    self.abort_requests(self.prompt_id_2_request_ids[prompt_id])
+        except Exception as e:
+            self.exception_queue.put(e)
+
+        pydevd_pycharm.stoptrace()

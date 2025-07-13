@@ -15,6 +15,9 @@ from vllm.engine.arg_utils import (HfOverrides, PoolerConfig, TaskOption)
 from roll.third_party.vllm.vllm_0_8_4.llm_engine import LLMEngine084
 from roll.utils.send_recv_utils import SendBucketManager
 
+from roll.utils.logging import get_logger
+
+logger = get_logger()
 
 class Llm084(LLM):
 
@@ -129,6 +132,8 @@ class Llm084(LLM):
 
     def fetch_output(self):
         output_list = []
+        unfinished_output_list = []
+
         # simulating non blocking semantic when using v1 engine
         if envs.VLLM_USE_V1:
             try:
@@ -141,7 +146,10 @@ class Llm084(LLM):
         for request_output in request_outputs:
             if request_output.finished:
                 output_list.append(request_output)
-        return output_list
+            else:
+                unfinished_output_list.append(request_output)
+
+        return output_list, unfinished_output_list
 
     def get_num_waiting(self):
         stats = self.llm_engine._get_stats(scheduler_outputs=None)
@@ -180,6 +188,9 @@ class Llm084(LLM):
                     "type": "token",
                     "prompt_token_ids": token_ids
                 }
+            
+            logger.info(f"llm engine add request {request_id} with processed_inputs  length {len(processed_inputs['prompt_token_ids'])} sampling_params {sampling_params} token ids {processed_inputs['prompt_token_ids']}")
+            # assert len(processed_inputs["prompt_token_ids"]) < 200, "my test should not exceed 200 tokens, please check the input preparetion logic perhaps of interrupted requests"
             self.llm_engine._add_processed_request(request_id=request_id,
                                                    processed_inputs=processed_inputs,
                                                    params=sampling_params,
@@ -189,6 +200,9 @@ class Llm084(LLM):
                                                 )
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
+
+        logger.info(f"Aborting requests for output_processor: {request_id}")
+
         self.llm_engine.abort_request(request_id)
 
     def clear_unfinished_requests(self):

@@ -10,6 +10,9 @@ import torch
 from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase, ProcessorMixin, BatchFeature
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from transformers.utils import PaddingStrategy
+from roll.utils.logging import get_logger
+
+logger = get_logger()
 
 
 def collate_fn_to_dict_list(data_list: list[dict]) -> dict:
@@ -53,6 +56,20 @@ class DataCollatorWithPaddingForPaddedKeys:
         padded_features = [{k: v for k, v in feature.items() if k in self.padded_keys} for feature in features]
         un_padded_features = [{k: v for k, v in feature.items() if k not in self.padded_keys} for feature in features]
 
+        # Debug: Log the input features
+        logger.info(f"COLLATOR_DEBUG: Processing {len(features)} features")
+        for i, feature in enumerate(features):
+            if 'input_ids' in feature:
+                input_ids = feature['input_ids']
+                logger.info(f"COLLATOR_DEBUG: Feature_{i}: input_ids_len={len(input_ids)}, input_ids_first_10={input_ids[:10]}")
+            
+            # Log any text content for comparison
+            for key in ['prompt', 'text', 'messages', 'ground_truth']:
+                if key in feature:
+                    text_data = feature[key]
+                    sample_text = str(text_data)[:100] if text_data else "None"
+                    logger.info(f"COLLATOR_DEBUG: Feature_{i}: {key}_sample='{sample_text}'")
+
         batch = pad_without_fast_tokenizer_warning(
             self.tokenizer,
             padded_features,
@@ -61,6 +78,13 @@ class DataCollatorWithPaddingForPaddedKeys:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=self.return_tensors,
         )
+        
+        # Debug: Log the output batch
+        if 'input_ids' in batch:
+            logger.info(f"COLLATOR_DEBUG: Output batch: input_ids_shape={batch['input_ids'].shape}")
+            for i in range(len(batch['input_ids'])):
+                logger.info(f"COLLATOR_DEBUG: Batch_output_{i}: input_ids_first_10={batch['input_ids'][i][:10].tolist()}")
+        
         batch["position_ids"] = torch.clip(torch.cumsum(batch["attention_mask"], dim=-1) - 1, min=0, max=None)
         un_padded_batch = collate_fn_to_dict_list(un_padded_features)
         batch.update(un_padded_batch)

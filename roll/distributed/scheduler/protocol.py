@@ -18,6 +18,9 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
 from roll.utils.functionals import union_two_dict, divide_by_chunk_size
+from roll.utils.logging import get_logger
+
+logger = get_logger()
 
 try:
     tensordict.set_lazy_legacy(False).set()
@@ -604,7 +607,86 @@ class DataProto:
         for batch in data:
             if batch.batch is not None:
                 batch_lst.append(batch.batch)
+        
         if len(batch_lst) > 0 and batch_lst[0] is not None:
+            # Add comprehensive logging to verify tensor dimensions before concatenation
+            logger.info(f"[CONCAT] Attempting to concatenate {len(batch_lst)} batches")
+            
+            # Collect all tensor keys and verify dimensions
+            all_keys = set()
+            for i, batch in enumerate(batch_lst):
+                all_keys.update(batch.keys())
+            
+            logger.info(f"[CONCAT] Found tensor keys: {list(all_keys)}")
+            
+            # Verify dimensions for each key across all batches
+            dimension_mismatches = []
+            for key in all_keys:
+                shapes = []
+                request_ids = []
+                
+                for i, batch in enumerate(batch_lst):
+                    if key in batch:
+                        shape = batch[key].shape
+                        shapes.append(shape)
+                        # Try to get request_id from meta_info if available
+                        request_id = "unknown"
+                        if i < len(data) and data[i].meta_info and "request_id" in data[i].meta_info:
+                            request_id = data[i].meta_info["request_id"]
+                        request_ids.append(request_id)
+                
+                # Check for dimension mismatches (excluding dim=0 which should vary)
+                if len(shapes) > 1:
+                    expected_shape = shapes[0][1:]  # All dimensions except batch dimension
+                    for j, shape in enumerate(shapes[1:], 1):
+                        actual_shape = shape[1:]  # All dimensions except batch dimension
+                        if expected_shape != actual_shape:
+                            mismatch_info = {
+                                "key": key,
+                                "expected_shape": expected_shape,
+                                "actual_shape": actual_shape,
+                                "expected_request_id": request_ids[0],
+                                "mismatched_request_id": request_ids[j],
+                                "all_shapes": shapes,
+                                "all_request_ids": request_ids
+                            }
+                            dimension_mismatches.append(mismatch_info)
+                            
+                            logger.error(f"[CONCAT] DIMENSION MISMATCH for key '{key}':")
+                            logger.error(f"  Expected shape: {expected_shape} (request_id: {request_ids[0]})")
+                            logger.error(f"  Actual shape: {actual_shape} (request_id: {request_ids[j]})")
+                            logger.error(f"  All shapes for this key: {shapes}")
+                            logger.error(f"  All request IDs for this key: {request_ids}")
+            
+            # Log summary of all tensor shapes for debugging
+            logger.info(f"[CONCAT] Summary of tensor shapes across all batches:")
+            for key in all_keys:
+                shapes = []
+                request_ids = []
+                for i, batch in enumerate(batch_lst):
+                    if key in batch:
+                        shapes.append(batch[key].shape)
+                        request_id = "unknown"
+                        if i < len(data) and data[i].meta_info and "request_id" in data[i].meta_info:
+                            request_id = data[i].meta_info["request_id"]
+                        request_ids.append(request_id)
+                logger.info(f"  Key '{key}': shapes={shapes}, request_ids={request_ids}")
+            
+            # If there are dimension mismatches, log detailed error and raise exception
+            if dimension_mismatches:
+                logger.error(f"[CONCAT] Found {len(dimension_mismatches)} dimension mismatches:")
+                for mismatch in dimension_mismatches:
+                    logger.error(f"  Key: {mismatch['key']}")
+                    logger.error(f"  Expected: {mismatch['expected_shape']} (request_id: {mismatch['expected_request_id']})")
+                    logger.error(f"  Actual: {mismatch['actual_shape']} (request_id: {mismatch['mismatched_request_id']})")
+                    logger.error(f"  All shapes: {mismatch['all_shapes']}")
+                    logger.error(f"  All request IDs: {mismatch['all_request_ids']}")
+                
+                # Raise the original error with additional context
+                raise RuntimeError(f"Tensor dimension mismatch detected. Found {len(dimension_mismatches)} mismatches. Check logs for details.")
+            
+            # If all dimensions match, proceed with concatenation
+            logger.info(f"[CONCAT] All tensor dimensions verified. Proceeding with concatenation.")
             new_batch = torch.cat(batch_lst, dim=0)
         else:
             new_batch = None

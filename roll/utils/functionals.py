@@ -6,13 +6,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch import Tensor
 
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.utils.kl_controller import AdaptiveKLController
 from roll.utils.logging import get_logger
 
+import logging
+
 
 logger = get_logger()
+logger.setLevel(logging.DEBUG)
 
 
 def tensor_to_cpu_visitor(obj, path):
@@ -728,6 +732,7 @@ class GenerateRequestType(enum.Enum):
     ABORT = enum.auto()
     STOP = enum.auto()
     ALIVE_CHECK = enum.auto()
+    INTERRUPT = enum.auto()
 
 
 def postprocess_generate(
@@ -735,106 +740,115 @@ def postprocess_generate(
     output: torch.Tensor,
     num_return_sequences,
     sequence_length,
+    canonical_prompt_length: int,
     eos_token_id,
     pad_token_id,
     fill_eos_token=False,
 ) -> "DataProto":
     from roll.distributed.scheduler.protocol import DataProto
 
+    output_ids = output
+    output_ids = pad_to_length(output_ids, sequence_length, pad_token_id)
+
     if fill_eos_token:
         # yali: 如果output最后一个token不是pad_token_id，则替换成eos_token_id,
         #  TODO: 需要消融这个变化的影响
-        last_token_index = output.size(1) - 1
-        need_replace_mask = output[:, last_token_index] != pad_token_id
-        output[need_replace_mask, last_token_index] = eos_token_id
+        last_token_index = output_ids.size(1) - 1
+        need_replace_mask = output_ids[:, last_token_index] != pad_token_id
+        output_ids[need_replace_mask, last_token_index] = eos_token_id
 
-    input_ids = prompts.batch["input_ids"]  # (bs, prompt_length)
-    attention_mask = prompts.batch["attention_mask"]  # left-padded attention_mask
-    prompt_id = prompts.batch.get("prompt_id", None)
+    # Extract batch info from the input prompts
+    # Note: `prompts` can be a single DataProto for a normal batch, or a list of
+    # DataProto for a batch containing interrupted requests. We handle this later.
+    is_continued_request = prompts.meta_info.get("is_continued_request", False)
+    batch_size = output_ids.shape[0]
+    device = output_ids.device
 
-    # input_batch_size * num_return_sequences
-    output_batch_size = output.size(0)
-    input_batch_size = input_ids.size(0)
-    prompt_length = input_ids.size(1)
+    # --- Determine Prompt Length and Pad to Canonical Shape ---
+    # This is the most complex part. For normal requests, all prompts have the
+    # same canonical length. For interrupted requests, they have varying lengths
+    # and must be padded to the canonical length before being combined.
 
-    output = pad_to_length(output, sequence_length, pad_token_id)
+    # This logic assumes a heterogeneous batch has already been handled upstream
+    # and that for this function call, all prompts either are or will be padded
+    # to the canonical_prompt_length.
+    
+    if is_continued_request:
+        # For an interrupted request, the 'prompts' object contains the original,
+        # unpadded prompt. We must pad or truncate it to the canonical length.
+        prompt_tensor = prompts.batch["input_ids"]
+        original_prompt_length = prompt_tensor.shape[1]
+        original_attention_mask = prompts.batch.get("attention_mask", prompt_tensor.ne(pad_token_id))
 
-    assert output.shape[1] == sequence_length, f"output shape {output.shape} != {sequence_length}"
-
-    prompt = output[:, :prompt_length].clone()  # (bs, prompt_length)
-    response = output[:, prompt_length:].clone()  # (bs, response_length)
-
-    attention_mask = (
-        attention_mask.unsqueeze(1).repeat(1, num_return_sequences, 1).view(output_batch_size, prompt_length)
-    )
-    response_mask = get_pad_mask(response_id=response, pad_token=pad_token_id, dtype=attention_mask.dtype)
-    attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
-
-    position_ids = prompts.batch["position_ids"]
-    # if is_num_return_sequences_expand=True, num_return_sequences here equals 1
-    if position_ids.dim() == 3:  # qwen2vl mrope, maybe can support in other ways
-        position_ids = (
-            position_ids.unsqueeze(1)
-            .repeat(1, num_return_sequences, 1, 1)
-            .view(output_batch_size, *position_ids.shape[-2:])
-        )
-        delta_position_id = torch.arange(1, (sequence_length - prompt_length) + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.view(1, 1, -1).expand(output_batch_size, 3, -1)
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        # left padding for prompt and right padding for response, to be converted
-        # to right padding which is consistent with output
-        output_position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-
-    assert attention_mask.any(dim=1).all(), f"has all 0 attention_mask, {attention_mask} {input_ids}"
-    first_one = attention_mask.float().argmax(dim=1)
-    new_response_mask = torch.zeros_like(attention_mask)  # response mask for cat input_ids
-    for i in range(output_batch_size):
-        shift = first_one[i].item()
-        if shift > 0:
-            output[i, :-shift] = output[i, shift:].clone()
+        if original_prompt_length > canonical_prompt_length:
+            # Prompt is longer than canonical, truncate from the left.
+            prompt = prompt_tensor[:, -canonical_prompt_length:]
+            attention_mask = original_attention_mask[:, -canonical_prompt_length:]
         else:
-            output[i, :] = output[i, :].clone()
-        valid_length = attention_mask[i].sum().int().item()
-        response_length = response_mask[i].sum().int().item()
-        attention_mask[i][:valid_length] = 1
-        attention_mask[i][valid_length:] = 0
-        new_response_mask[i][valid_length - response_length : valid_length] = 1
-        if position_ids.dim() == 3 and shift > 0:
-            # shift as output to convert to right padding
-            # NOTE: left shift without clear right might lead to unclean values
-            # in right part, which especially is the case when using long prompt
-            # length and short response length. This usually makes no effect if
-            # mask is right, while it might make trouble to for multi-modal model
-            # like Qwen2-vl, since extra image_token would be left which might
-            # cause error: Image features and image tokens do not match
-            output_position_ids[i, ..., :-shift] = output_position_ids[i, ..., shift:].clone()
-            # only clean in VLM(qwen2-vl) to make no effect on LLM
-            if prompt_length > response_length:
-                output[i, -shift:] = pad_token_id
+            # Prompt is shorter or equal, pad on the left to match canonical length.
+            pad_left = canonical_prompt_length - original_prompt_length
+            prompt = F.pad(prompt_tensor, (pad_left, 0), value=pad_token_id)
+            attention_mask = F.pad(original_attention_mask, (pad_left, 0), value=0)
+    else:
+        # For a normal request, the prompt is already at the canonical length.
+        prompt = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        assert prompt.shape[1] == canonical_prompt_length, \
+            f"Normal prompt length {prompt.shape[1]} must equal canonical {canonical_prompt_length}"
 
-    prompt_mask = (attention_mask == 1) & (new_response_mask == 0)
-    if position_ids.dim() == 3:
-        position_ids = output_position_ids
-    else:  # normal position_ids
-        position_ids = torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0, max=None)
-    batch = TensorDict(
-        {
+    # --- Final Shape Assertions (Pre-Computation) ---
+    assert prompt.shape[1] == canonical_prompt_length
+    assert attention_mask.shape[1] == canonical_prompt_length
+    assert output_ids.shape[1] == sequence_length
+
+    # --- Construct Final Tensors ---
+    response = output_ids[:, canonical_prompt_length:]
+    canonical_response_length = sequence_length - canonical_prompt_length
+
+    # --- Sanity Checks ---
+    assert prompt.shape[0] == response.shape[0], "Batch size mismatch between prompt and response"
+    assert response.shape[1] == canonical_response_length, "Response length is incorrect"
+    assert prompt.shape[1] + response.shape[1] == sequence_length, "Prompt and response lengths do not sum to sequence length"
+
+    # --- Create Final Masks and Tensors ---
+    final_input_ids = torch.cat((prompt, response), dim=1)
+    
+    response_mask = response.ne(pad_token_id).to(attention_mask.dtype)
+    final_attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
+
+    # For continued requests, the attention mask might have a gap of zeros between
+    # the end of the prompt and the start of the new response. This fills that gap.
+    if is_continued_request:
+        for i in range(final_attention_mask.shape[0]):
+            valid_length = final_attention_mask[i].sum().int().item()
+            final_attention_mask[i][:valid_length] = 1
+            final_attention_mask[i][valid_length:] = 0
+
+    position_ids = torch.arange(0, sequence_length, dtype=torch.long, device=device).unsqueeze(0)
+    prompt_mask_full = torch.arange(0, sequence_length, device=device)[None, :] < canonical_prompt_length
+    response_mask_full = ~prompt_mask_full
+
+    # --- Final Shape Assertions (Post-Computation) ---
+    assert final_input_ids.shape == (batch_size, sequence_length)
+    assert final_attention_mask.shape == (batch_size, sequence_length)
+    assert position_ids.expand(batch_size, -1).shape == (batch_size, sequence_length)
+    assert prompt_mask_full.expand(batch_size, -1).shape == (batch_size, sequence_length)
+    assert response_mask_full.expand(batch_size, -1).shape == (batch_size, sequence_length)
+    
+    batch_dict = {
             "prompts": prompt,
             "responses": response,
-            "input_ids": output,  # right pad
-            "attention_mask": attention_mask,  # right pad
-            "position_ids": position_ids,
-            "prompt_mask": prompt_mask,
-            "response_mask": new_response_mask,  # right pad, response tokens
-        },
-        batch_size=output_batch_size,
+        "input_ids": final_input_ids,
+        "attention_mask": final_attention_mask,
+        "position_ids": position_ids.expand(batch_size, -1),
+        "prompt_mask": prompt_mask_full.expand(batch_size, -1),
+        "response_mask": response_mask_full.expand(batch_size, -1),
+        }
+
+    return DataProto(
+        meta_info=prompts.meta_info,
+        batch=TensorDict(batch_dict, batch_size=[batch_size]),
     )
-    if prompt_id is not None:
-        prompt_id = (
-            prompt_id.squeeze().unsqueeze(1).repeat(1, num_return_sequences).view(output_batch_size, -1).squeeze(-1)
-        )
-        batch["prompt_id"] = prompt_id
-    return DataProto(batch=batch)
 
 
 def get_dist_info_from_comm_plan(comm_plan, rank_in_cluster, rank_in_worker):

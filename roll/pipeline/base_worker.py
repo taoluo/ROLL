@@ -59,6 +59,15 @@ class ActorWorker(Worker):
         # current process is used as engine client when using vllm v1 engine, and
         # there is no chance to init cuda context.
         torch.cuda.init()
+        # Training scheduler (use_additional_prompts = True or default)
+        import pydevd_pycharm
+
+        debug_port = 12345
+        scheduler_type = "TRAINING"
+        self.logger.info(f"Connecting PyCharm debugger on port {debug_port}")
+        if os.getenv("PYCHARM", "0") == "1":
+            pydevd_pycharm.settrace('localhost', port=debug_port, stdoutToServer=True, stderrToServer=True, suspend=False)
+        self.logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step(self, data: DataProto):
@@ -352,7 +361,10 @@ class ActorWorker(Worker):
             if self.thread_server is not None:
                 if not self.thread_server.is_alive():
                     raise Exception("thread server has stopped unexpectedly. check stderr for more info.")
-            output = DataProto(meta_info={"request_counts": len(self.response_call_back_fns)})
+            output = DataProto(meta_info={"request_counts": len(self.response_call_back_fns),
+                                          "registered_requests_callbacks": list(self.response_call_back_fns.keys())
+                                          })
+
             return output
         elif command == GenerateRequestType.ADD:
             assert "response_callback_fn" in data.meta_info, "response_callback_fn is not in data.meta_info"
@@ -370,6 +382,8 @@ class ActorWorker(Worker):
             ] + self.tokenizer.additional_special_tokens_ids
             generation_config["pad_token_id"] = self.tokenizer.pad_token_id
             data.meta_info["generation_config"] = generation_config
+            self.logger.info(
+                f"worker add_request: {data.meta_info['request_id']} callback_fn: {data.meta_info.get('response_callback_fn', None)}")
             self.response_call_back_fns[data.meta_info["request_id"]] = data.meta_info.pop("response_callback_fn")
         self.strategy.add_request(command=command, data=data)
         return DataProto(meta_info={"request_counts": len(self.response_call_back_fns)})
@@ -377,6 +391,11 @@ class ActorWorker(Worker):
     def request_complete(self, data: DataProto):
         data.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
         data.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+        fn = self.response_call_back_fns.get(data.meta_info["request_id"], None)
+        self.logger.info(
+            f"worker request_complete: pop from response_call_back_fns callback_fn for {data.meta_info['request_id']}: {fn}")
+        # tao perhaps not call it untill finishes.
+
         response_call_back_fn = self.response_call_back_fns.pop(data.meta_info["request_id"])
         self.response_callback_refs.append(response_call_back_fn(data))
 
