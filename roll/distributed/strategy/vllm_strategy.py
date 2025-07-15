@@ -41,7 +41,7 @@ class VllmStrategy(InferenceStrategy):
         self.recv_manager = RecvBucketManager()
         self.command_queue: Optional[queue.Queue] = None
 
-        self.request_metas = {}
+        self.request_metas = {} # used to keep track of requests to callback
         self.group_name = "vllm_worker_default"
         self.running = False
 
@@ -153,9 +153,12 @@ class VllmStrategy(InferenceStrategy):
 
         return output
 
-    def process_interrupted_batch(self, interrupted_batch: DataProto, request_complete_callback):
-        # added batch but not started running/waiting
-        output_data = DataProto(meta_info=interrupted_batch.meta_info)
+    def process_interrupted_batch(self, request_id: str, request_complete_callback):
+        # added req but not started running/waiting
+        # key should exist
+        assert request_id in self.request_metas, 'key should exist in request_metas'
+
+        output_data = DataProto(meta_info=self.request_metas[request_id])
         output_data.meta_info["finish_status"] = "interrupted"
         output_data.meta_info["output_token_ids"] = []  # No output tokens for interrupted batch
         logger.info(f"process_interrupted_batch: request_id {output_data.meta_info['request_id']}")
@@ -163,25 +166,34 @@ class VllmStrategy(InferenceStrategy):
 
     def handle_vllm_output(self, finished_vllm_outputs: List[RequestOutput],  interrupted_rid_set, request_complete_callback):
         finished_req_ids = [ ]
+        to_callback_output = []
         # handle finshed first, then interrupted
         for request_output in finished_vllm_outputs:
             assert request_output.finished, "should be finished req"
-            # still in added_batch not aborted, process the request output
-            finished_req_ids.append(request_output.request_id)
-
-            self.added_batch.pop(request_output.request_id)
             self.unfinished_vllm_outputs.pop(request_output.request_id, None)
 
-        if finished_vllm_outputs:
+            # still in request_metas not aborted, process the request output
+            if request_output.request_id in self.request_metas:
+
+                finished_req_ids.append(request_output.request_id)
+                to_callback_output.append(request_output)
+
+
+
+        if to_callback_output:
             logger.info(
-            f"process_vllm_output: finished request from fetch_output and in added_batch,  request_ids {finished_req_ids}")
+            f"process_vllm_output: finished request from fetch_output and in request_metas,  request_ids {finished_req_ids} calling callback")
+            # this assumes req is in self.request_metas
             self.process_vllm_output(vllm_outputs=finished_vllm_outputs,
                                  request_complete_callback=request_complete_callback)
 
+        # pop the finished request metas after callback
+        for request_id in finished_req_ids:
+            self.request_metas.pop(request_id)
 
         for req_id in interrupted_rid_set:
 
-            if req_id in self.added_batch:
+            if req_id in self.request_metas:
 
                 if req_id in self.unfinished_vllm_outputs:
                     logger.info(f'handle_vllm_output: interrupted request_id {req_id} has partial output')
@@ -201,10 +213,9 @@ class VllmStrategy(InferenceStrategy):
 
                 else:
                     logger.info(f"handle_vllm_output: interrupted request_id {req_id} no partial output yet, just process the from added_batch")
-                    interrupted_batch = self.added_batch[req_id]
-                    self.process_interrupted_batch(interrupted_batch, request_complete_callback)
+                    self.process_interrupted_batch(req_id, request_complete_callback)
 
-                self.added_batch.pop(req_id)
+                self.request_metas.pop(req_id)
 
             else:
                 logger.warning(f"handle_vllm_output: interrupted request_id {req_id} not found in added_batch, skipping perhaps already finished or aborted")
@@ -219,10 +230,11 @@ class VllmStrategy(InferenceStrategy):
             output_token_ids = []
             request_id = request_output.request_id
             if request_id not in self.request_metas:
+                logger.warning(f"process_vllm_output: request_id {request_id} not in request_metas, skipping")
                 continue
             for completion_output in request_output.outputs:
                 output_token_ids.append(completion_output.token_ids)
-            output_data = DataProto(meta_info=self.request_metas.pop(request_id))
+            output_data = DataProto(meta_info=self.request_metas[request_id])
             output_data.meta_info["output_token_ids"] = output_token_ids
 
             if request_output.finished:
@@ -245,7 +257,6 @@ class VllmStrategy(InferenceStrategy):
         collective.barrier(group_name=self.group_name)
         self.running = True
         self.unfinished_vllm_outputs = {}
-        self.added_batch = {}
         interrupted_rid_set = set()
         while True:
             while not self.command_queue.empty():
@@ -381,26 +392,23 @@ class VllmStrategy(InferenceStrategy):
                                             prompt_token_ids=prompt_token_ids,
                                             sampling_params=sampling_params,
                                             multi_modal_data=multi_modal_data)
-                    self.added_batch[request_id] = batch
                     logger.info(f"request {request_id} added")
 
                 elif command == GenerateRequestType.ABORT:
                     request_id = batch.meta_info["request_id"]
-                    assert request_id in self.added_batch, f"request_id {request_id} not in added_batch"
+                    assert request_id in self.request_metas
+                    logger.info(f"{request_id=} abort command sent to backend engine, remove from request_metas")
                     self.model.abort_request(request_id=request_id)
-                    #     fixme pop req from request_metas ??
-                    self.added_batch.pop(request_id)
-                    self.unfinished_vllm_outputs.pop(request_id)
-                    logger.info(f"request {request_id} aborted")
+                    self.request_metas.pop(request_id)
 
                 elif command == GenerateRequestType.INTERRUPT:
                     request_id = batch.meta_info["request_id"]
-                    if request_id in self.added_batch:
+                    if request_id in self.request_metas:
                         logger.info(f"interrupt request command sent to backend engine")
                         self.model.abort_request(request_id=request_id)
                         interrupted_rid_set.add(request_id)
                     else:
-                        logger.warning(f"interrupt request command received bu not in added_batch: {request_id=}")
+                        logger.warning(f"interrupt request {request_id=} command received bu not in request_metas: {self.request_metas.keys()} ")
                 elif command == GenerateRequestType.STOP:
                     self.model.abort_request(request_id=list(self.request_metas.keys()))
                     self.request_metas.clear()
@@ -411,7 +419,6 @@ class VllmStrategy(InferenceStrategy):
                     # model execute loop or there will be garbage output at next step.
                     self.model.clear_unfinished_requests()
                     self.running = False
-                    self.added_batch.clear()
                     self.unfinished_vllm_outputs.clear()
                     return
 
@@ -420,7 +427,7 @@ class VllmStrategy(InferenceStrategy):
             for request_output in unfinished_vllm_outputs:
 
                 # if request in added_batch/not aborted, update the buffered the partial request output
-                if request_output.request_id in self.added_batch:
+                if request_output.request_id in self.request_metas:
                     self.unfinished_vllm_outputs[request_output.request_id] = request_output
 
             # Log finished outputs for debugging
@@ -473,25 +480,6 @@ class VllmStrategy(InferenceStrategy):
             #
             # self.handle_interrupted_requests(request_complete_callback)
 
-    def handle_interrupted_requests(self,     request_complete_callback):
-        for req_id in self.interrupted_rid_set:
-            # not handled by finished output yet
-            if req_id in self.added_batch:
-                last_output = self.unfinished_vllm_outputs.pop(req_id, None)
-                # added and partial output available
-                if last_output:
-                    logger.info(f"handle_interrupted_requests: request_id {req_id} has partial output")
-                    self.process_vllm_output(last_output, request_complete_callback)
-                else:
-                    # no partial output, just process the from added_batch
-                    logger.info(f"handle_interrupted_requests: request_id {req_id} no partial output yet, just process the from added_batch")
-                    interrupted_batch = self.added_batch[req_id]
-                    self.process_interrupted_batch(interrupted_batch, request_complete_callback)
-
-                self.added_batch.pop(req_id, None)
-
-            else:
-                logger.warning(f"handle_interrupted_requests: request_id {req_id} not found in added_batch, skipping")
 
     def add_request(self, command, data: DataProto):
         self.command_queue.put((command, data))
