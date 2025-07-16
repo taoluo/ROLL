@@ -552,8 +552,20 @@ class DynamicSamplingScheduler:
                 continue
 
             if not self.check_send_new_request():
-                time.sleep(1)
-                continue
+                req_bf = set(self.requests_buffers.keys())
+                callback_request_ids = req_bf - self.abort_request_ids
+                if not callback_request_ids:
+                    logger.info(f"requests callback buffers empty {req_bf=} - {self.abort_request_ids=} , sleep 5 sec to finish all requests and break")
+                    time.sleep(5)
+                    buffer_len = len(self.completed_buffers)
+                    logger.info(f"buffer len {buffer_len} before break ")
+                    break
+                else:
+
+                    logger.info(f"buffer is not empty, {callback_request_ids=}, sleep 1 sec")
+
+                    time.sleep(1)
+                    continue
 
             # get a query from dataset
             prompt_id = next(prompt_id_counter)
@@ -593,7 +605,7 @@ class DynamicSamplingScheduler:
 
         completed_buffers = {k: v for k, v in self.completed_buffers.items() if len(v) > 0}
         collect_data = [item for sublist in list(completed_buffers.values())[:] for item in sublist]
-        
+        assert len(collect_data) > 0, "No collect data found, check if the dataset is empty or all requests are filtered out."
         # **LOG ALL INDIVIDUAL REQUESTS**: Before concatenation, log each request's detailed info
         logger.info(f"SCHEDULER_COLLECT_DATA: Found {len(collect_data)} total responses from {len(completed_buffers)} queries")
         for i, data_item in enumerate(collect_data):
@@ -629,7 +641,8 @@ class DynamicSamplingScheduler:
         )
 
         # TODO: 这里 len(collect_data) > rollout_batch_size, 可以尝试动态扩大batch_size
-        batch = DataProto.concat(collect_data[: self.batch_size * num_return_sequences])
+        batch_size = min(self.batch_size * num_return_sequences, len(collect_data))
+        batch = DataProto.concat(collect_data[: batch_size])
         batch.meta_info["metrics"] = {
             f"scheduler/query_filter_count": self.query_filter_count,
             f"scheduler/response_filter_count": self.response_filter_count,
@@ -961,8 +974,9 @@ class DynamicSamplingScheduler:
         """Get all request_ids currently assigned to a specific DP rank"""
         running_request_ids = []
         with self.lock:
+            # all unfinished requests
             for request_id in self.requests_buffers.keys():
-                if self.request_id_2_dp_rank[request_id] == target_dp_rank:
+                if self.request_id_2_dp_rank[request_id] == target_dp_rank and request_id not in self.abort_request_ids:
                     running_request_ids.append(request_id)
 
         return running_request_ids
@@ -974,7 +988,6 @@ class DynamicSamplingScheduler:
         data 返回可能有多条的
         """
 
-        import pydevd_pycharm
 
 
         try:
@@ -1009,17 +1022,17 @@ class DynamicSamplingScheduler:
             with self.lock:
                 if data.meta_info["finish_status"] == "interrupted":
                     # **ENHANCED LOGGING**: Track prompt length and output lengths for interrupted requests
-                    
+
                     # Get the original request to analyze lengths
                     original_request = self.requests_buffers.get(request_id, None)
                     original_prompt_length = 0
                     cumulative_partial_output_length = 0
                     migration_count = 0
-                    
+
                     if original_request:
                         original_input_ids = original_request.batch["input_ids"]
                         concatenated_input_length = original_input_ids.shape[1]
-                        
+
                         # Check if this is a continued request
                         is_continued_request = original_request.meta_info.get("is_continued_request", False)
                         if is_continued_request:
@@ -1030,20 +1043,20 @@ class DynamicSamplingScheduler:
                         else:
                             # For original requests, the input length is the original prompt length
                             original_prompt_length = concatenated_input_length
-                    
+
                     # Get the newly generated output tokens from this interruption
                     output_token_ids = data.meta_info.get("output_token_ids", [])
                     newly_generated_length = 0
                     if output_token_ids and len(output_token_ids) > 0 and len(output_token_ids[0]) > 0:
                         newly_generated_length = len(output_token_ids[0])
-                    
+
                     # Single comprehensive log entry
                     logger.info(f"Migration: BUFFERING interrupted request {request_id}: "
                                f"original_prompt_length={original_prompt_length}, "
                                f"cumulative_partial_output_length={cumulative_partial_output_length}, "
                                f"newly_generated_length={newly_generated_length}, "
                                f"migration_count={migration_count}")
-                    
+
                     self.interrupted_query_group_buffers[prompt_id].append(data)
                     logger.info(
                         f"Migration: Added interrupted batch for prompt_id {prompt_id} to buffer {list(self.interrupted_query_group_buffers.keys())}")
@@ -1133,7 +1146,6 @@ class DynamicSamplingScheduler:
         except Exception as e:
             self.exception_queue.put(e)
 
-        pydevd_pycharm.stoptrace()
 
     def get_fixed_dataset_item(self, dataset_index=0):
         """Fixed dataset item for testing - always returns the same item"""
@@ -1183,15 +1195,21 @@ class DynamicSamplingScheduler:
 
     def abort_requests(self, request_ids: Set[str]):
         abort_refs = []
-        self.running_prompts -= 1
+        request_ids = request_ids.copy()
         for request_id in request_ids:
+            assert request_id not in self.abort_request_ids
             dp_rank = self.request_id_2_dp_rank[request_id]
             self.load_balance_coordinator[dp_rank] -= 1
+            prompt_id = self.request_id_2_prompt_id[request_id]
+            self.prompt_id_2_request_ids[prompt_id].remove(request_id)
+            if len(self.prompt_id_2_request_ids[prompt_id]) == 0:
+                self.running_prompts -= 1
             abort_refs.append(
                 self.actor_cluster.workers[dp_rank].add_request.remote(
                     command=GenerateRequestType.ABORT, data=DataProto(meta_info={"request_id": request_id})
                 )
             )
+            self.abort_request_ids.add(request_id)
 
     def postprocess_output_ids(self, data: DataProto) -> DataProto:
         # postprocess_generate, input_ids, attention_mask, left pad
