@@ -503,13 +503,11 @@ class DynamicSamplingScheduler:
         prompt_id_counter = itertools.count()
         self.generation_config = copy.deepcopy(data.meta_info["generation_config"])
         num_return_sequences = self.generation_config["num_return_sequences"]
-        has_interrupted_any = False
-        enable_migration = True
-        # enable_migration = False
-        # interrupt_timeout_threshold = [ 2, 4, 6]
-        interrupt_timeout_threshold = [ 2, ]
-        last_interrupt_threshold_count = 0
-        start = time.time()
+
+        enable_dynamic_ld = True # enable dynamic load balance, if False, we will not check dp worker load and interrupt requests
+        rebalance_threshold = 10 # rebalance threshold, if the dp worker load difference is larger than this value, we will interrupt some requests
+
+
         while True:
             if (
                 sum([len(v) for v in list(self.completed_buffers.values())[:]])
@@ -521,28 +519,31 @@ class DynamicSamplingScheduler:
             self.check_response_callback()
 
 
-            elapse_time = time.time() - start
-            current_timeout_threshold_count = sum([ elapse_time> threshold for threshold in interrupt_timeout_threshold])
-            # if enable_migration and (not has_interrupted_any) and self.postprocessed_requests_count > 0:
-            if enable_migration and  current_timeout_threshold_count > last_interrupt_threshold_count:
-                # todo if interrupted buffer >0, resend interrupted.
-                # logger.info(f"Migration: postprocessed_requests_count {self.postprocessed_requests_count} > 0, check if need to migrate interrupted query group buffers.")
-                logger.info(f"Migration: interrupt after {elapse_time=}sec {current_timeout_threshold_count=}")
-                # self.interrupt_all_requests_by_dp_rank(0)  # interrupt all even ranks
-                # has_interrupted_any = True
-                # interrupt req 0, keep req 1 for comparison
-                self.actor_cluster.workers[0].add_request.remote(
-                    command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": '1'})
-                )
-                # interrupt req 1 and 0
-                self.actor_cluster.workers[0].add_request.remote(
-                    command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": '0'})
-                )
-                last_interrupt_threshold_count = current_timeout_threshold_count
+            if enable_dynamic_ld:
+                # check the difference between dp workers,
+                # if the difference is too large > 2 , interrupt all requests on the most loaded dp worker aggresively ,
+                # the load balance coordinator will handle the reroute
+                dp_imbalance_range = max(self.load_balance_coordinator.values()) - min(self.load_balance_coordinator.values())
+                if dp_imbalance_range >= rebalance_threshold:
+                    # find the most loaded dp worker
+                    max_rank = max(self.load_balance_coordinator, key=self.load_balance_coordinator.get)
+                    logger.info(f"Dynamic load balance: max dp rank {max_rank} load_balance_coordinator {self.load_balance_coordinator}")
+                    # leftover = dp_imbalance_range - interrupt_cnt = rebalance_threshold /2
+                    interrupt_cnt = int(dp_imbalance_range  -   rebalance_threshold / 2 )
+                    if interrupt_cnt > 0:
+                        req_to_interrupt = self.get_running_request_ids_for_dp_rank(max_rank)[-interrupt_cnt:]
+                        logger.info(
+                            f"Dynamic load balance: max dp rank {max_rank} interrupting {req_to_interrupt}"
+                        )
+
+                        for req in req_to_interrupt:
+                            self.actor_cluster.workers[max_rank].add_request.remote(
+                            command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": str(req)})
+                            )
+
 
             if self.interrupted_query_group_buffers:
 
-                # assert False,  f"Migration: Sending interrupted query group to DP rank {list(self.interrupted_query_group_buffers.keys())}"
 
                 target_dp_rank = next(self.get_available_dp_rank())
 
