@@ -504,10 +504,11 @@ class DynamicSamplingScheduler:
         self.generation_config = copy.deepcopy(data.meta_info["generation_config"])
         num_return_sequences = self.generation_config["num_return_sequences"]
 
-        enable_dynamic_ld = True # enable dynamic load balance, if False, we will not check dp worker load and interrupt requests
+        enable_dynamic_lb = True # enable dynamic load balance, if False, we will not check dp worker load and interrupt requests
         rebalance_threshold = 10 # rebalance threshold, if the dp worker load difference is larger than this value, we will interrupt some requests
 
-
+        last_interruption_time = None
+        freeze_interruption_timeout = 3  # after each interruption, wait 3 seconds to update load balancer from scheduler before check rebalance threshold
         while True:
             if (
                 sum([len(v) for v in list(self.completed_buffers.values())[:]])
@@ -519,7 +520,7 @@ class DynamicSamplingScheduler:
             self.check_response_callback()
 
 
-            if enable_dynamic_ld:
+            if enable_dynamic_lb  and last_interruption_time is None or time.time() - last_interruption_time > freeze_interruption_timeout:
                 # check the difference between dp workers,
                 # if the difference is too large > 2 , interrupt all requests on the most loaded dp worker aggresively ,
                 # the load balance coordinator will handle the reroute
@@ -540,6 +541,7 @@ class DynamicSamplingScheduler:
                             self.actor_cluster.workers[max_rank].add_request.remote(
                             command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": str(req)})
                             )
+                        last_interruption_time = time.time()
 
 
             if self.interrupted_query_group_buffers:
