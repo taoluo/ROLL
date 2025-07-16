@@ -520,7 +520,7 @@ class DynamicSamplingScheduler:
             self.check_response_callback()
 
 
-            if enable_dynamic_lb  and last_interruption_time is None or time.time() - last_interruption_time > freeze_interruption_timeout:
+            if enable_dynamic_lb and (last_interruption_time is None or time.time() - last_interruption_time > freeze_interruption_timeout):
                 # check the difference between dp workers,
                 # if the difference is too large > 2 , interrupt all requests on the most loaded dp worker aggresively ,
                 # the load balance coordinator will handle the reroute
