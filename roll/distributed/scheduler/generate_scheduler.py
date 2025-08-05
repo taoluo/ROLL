@@ -528,24 +528,20 @@ class DynamicSamplingScheduler:
                 with self.lock:
                     dp_imbalance_range = max(self.load_balance_coordinator.values()) - min(self.load_balance_coordinator.values())
                     max_rank = max(self.load_balance_coordinator, key=self.load_balance_coordinator.get)
+                    # leftover = dp_imbalance_range - interrupt_cnt = rebalance_threshold /2
+                    interrupt_cnt = dp_imbalance_range // 2
+                    leftover_cnt = self.load_balance_coordinator[max_rank] - interrupt_cnt
 
-                if dp_imbalance_range >= rebalance_threshold:
+                if dp_imbalance_range >= rebalance_threshold and interrupt_cnt > 0:
                     # find the most loaded dp worker
 
                     logger.info(f"Dynamic load balance: max dp rank {max_rank} load_balance_coordinator {self.load_balance_coordinator}")
-                    # leftover = dp_imbalance_range - interrupt_cnt = rebalance_threshold /2
-                    interrupt_cnt = int(dp_imbalance_range  -   rebalance_threshold / 2 )
-                    if interrupt_cnt > 0:
-                        req_to_interrupt = self.get_running_request_ids_for_dp_rank(max_rank)[-interrupt_cnt:]
-                        logger.info(
-                            f"Dynamic load balance: max dp rank {max_rank} interrupting {req_to_interrupt}"
+
+                    self.actor_cluster.workers[max_rank].add_request.remote(
+                            command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"target_leftover_cnt": leftover_cnt})
                         )
 
-                        for req in req_to_interrupt:
-                            self.actor_cluster.workers[max_rank].add_request.remote(
-                            command=GenerateRequestType.INTERRUPT, data=DataProto(meta_info={"request_id": str(req)})
-                            )
-                        last_interruption_time = time.time()
+                    last_interruption_time = time.time()
 
 
             if self.interrupted_query_group_buffers:
@@ -701,6 +697,18 @@ class DynamicSamplingScheduler:
             all_partial_tokens = []
             for batch in interrupted_batches:
                 partial_tokens = batch.meta_info.get("output_token_ids", [])
+                # Validate that we only have a single sequence
+                if partial_tokens and len(partial_tokens) > 1:
+                    logger.error(
+                        f"Migration error: Detected {len(partial_tokens)} sequences in interrupted batch "
+                        f"for request_id={batch.meta_info.get('request_id', 'unknown')}, "
+                        f"prompt_id={prompt_id}"
+                    )
+                    raise AssertionError(
+                        f"Multiple sequences not supported for request interruption/migration. "
+                        f"Found {len(partial_tokens)} sequences in output_token_ids. "
+                        f"Please use is_num_return_sequences_expand=True to handle multiple sequences as separate requests."
+                    )
                 if partial_tokens and len(partial_tokens) > 0 and len(partial_tokens[0]) > 0:
                     all_partial_tokens.extend(partial_tokens[0])
             

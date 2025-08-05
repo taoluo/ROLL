@@ -402,13 +402,83 @@ class VllmStrategy(InferenceStrategy):
                     self.request_metas.pop(request_id)
 
                 elif command == GenerateRequestType.INTERRUPT:
-                    request_id = batch.meta_info["request_id"]
-                    if request_id in self.request_metas:
-                        logger.info(f"interrupt request command sent to backend engine")
-                        self.model.abort_request(request_id=request_id)
-                        interrupted_rid_set.add(request_id)
-                    else:
-                        logger.warning(f"interrupt request {request_id=} command received bu not in request_metas: {self.request_metas.keys()} ")
+                    request_id = batch.meta_info.get("request_id", None)
+                    target_leftover_cnt = batch.meta_info.get("target_leftover_cnt", None)
+                    assert request_id is None ^ target_leftover_cnt is None, f"they are exclusive but got {request_id=} {target_leftover_cnt=}"
+                    if request_id:
+                        if request_id in self.request_metas:
+                            logger.info(f"interrupt request command sent to backend engine")
+                            self.model.abort_request(request_id=request_id)
+                            interrupted_rid_set.add(request_id)
+                        else:
+                            logger.warning(f"interrupt request {request_id=} command received but not in request_metas: {self.request_metas.keys()} perhaps already finished")
+                    if target_leftover_cnt:
+                        # interrupt requests up to the point of target_leftover_cnt,
+                        # sort request by the overhead of migration and find the easiest to interrupt
+                        
+                        # Get current request counts from vLLM scheduler
+                        # Access the first scheduler (assuming single GPU scheduling)
+                        scheduler = self.model.llm_engine.scheduler[0]
+                        
+                        # Count requests in different queues
+                        waiting_count = len(scheduler.waiting)
+                        running_count = len(scheduler.running)
+                        total_count = waiting_count + running_count
+                        
+                        # Calculate how many requests to interrupt
+                        interrupt_count = total_count - target_leftover_cnt
+                        
+                        if interrupt_count <= 0:
+                            logger.info(f"No interruption needed: total_count={total_count}, target_leftover={target_leftover_cnt}")
+                            continue
+                            
+                        logger.info(f"Dynamic load balance: need to interrupt {interrupt_count} requests "
+                                   f"(waiting={waiting_count}, running={running_count}, target_leftover={target_leftover_cnt})")
+                        
+                        requests_to_interrupt = []
+                        
+                        # Step 1: First interrupt all waiting (unscheduled) requests
+                        if waiting_count > 0:
+                            for seq_group in scheduler.waiting:
+                                if len(requests_to_interrupt) >= interrupt_count:
+                                    break
+                                request_id = seq_group.request_id
+                                assert request_id in self.request_metas, f"request_id {request_id} not found in request_metas buffer "
+                                requests_to_interrupt.append(request_id)
+
+                        
+                        # Step 2: If we still need to interrupt more, select from running requests
+                        if len(requests_to_interrupt) < interrupt_count:
+                            # Calculate total sequence length for each running request
+                            running_requests_with_length = []
+                            
+                            for seq_group in scheduler.running:
+                                request_id = seq_group.request_id
+                                assert request_id in self.request_metas, f"request_id {request_id} not found in request_metas buffer"
+                                    
+                                # Calculate total sequence length (prompt + generated tokens)
+                                total_length = 0
+                                for seq in seq_group.get_seqs():
+                                    total_length += seq.get_len()
+                                
+                                running_requests_with_length.append((request_id, total_length, seq_group))
+                                
+                            # Sort by total length (ascending) - interrupt shortest sequences first
+                            running_requests_with_length.sort(key=lambda x: x[1])
+                            
+                            # Select additional requests to interrupt
+                            remaining_to_interrupt = interrupt_count - len(requests_to_interrupt)
+                            for request_id, total_length, seq_group in running_requests_with_length[:remaining_to_interrupt]:
+                                requests_to_interrupt.append(request_id)
+                                logger.info(f"Selected running request {request_id} for interruption (total_length={total_length})")
+                        
+                        # Step 3: Abort the selected requests
+                        for request_id in requests_to_interrupt:
+                            logger.info(f"Interrupting request {request_id}")
+                            self.model.abort_request(request_id=request_id)
+                            interrupted_rid_set.add(request_id)
+
+
                 elif command == GenerateRequestType.STOP:
                     self.model.abort_request(request_id=list(self.request_metas.keys()))
                     self.request_metas.clear()
