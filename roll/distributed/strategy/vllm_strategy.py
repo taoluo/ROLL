@@ -184,7 +184,7 @@ class VllmStrategy(InferenceStrategy):
             logger.info(
             f"process_vllm_output: finished request from fetch_output and in request_metas,  request_ids {finished_req_ids} calling callback")
             # this assumes req is in self.request_metas
-            self.process_vllm_output(vllm_outputs=finished_vllm_outputs,
+            self.process_vllm_output(vllm_outputs=to_callback_output,
                                  request_complete_callback=request_complete_callback)
 
         # pop the finished request metas after callback

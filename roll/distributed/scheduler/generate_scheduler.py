@@ -180,11 +180,12 @@ class GenerateScheduler:
     def get_available_dp_rank(self):
         while True:
             # 负载均衡逻辑，期望各dp 正在处理的条数基本接近
-            sorted_ranks = sorted(
-                self.load_balance_coordinator.keys(), key=lambda rank: (self.load_balance_coordinator[rank], rank)
-            )
-            if self.load_balance_coordinator[sorted_ranks[0]] < self.max_running_requests:
-                yield sorted_ranks[0]
+            with self.lock:
+                sorted_ranks = sorted(
+                    self.load_balance_coordinator.keys(), key=lambda rank: (self.load_balance_coordinator[rank], rank)
+                )
+                if self.load_balance_coordinator[sorted_ranks[0]] < self.max_running_requests:
+                    yield sorted_ranks[0]
 
     def send_request_to_one_worker(self, data: DataProto):
         dp_rank = next(self.get_available_dp_rank())
@@ -524,10 +525,13 @@ class DynamicSamplingScheduler:
                 # check the difference between dp workers,
                 # if the difference is too large > 2 , interrupt all requests on the most loaded dp worker aggresively ,
                 # the load balance coordinator will handle the reroute
-                dp_imbalance_range = max(self.load_balance_coordinator.values()) - min(self.load_balance_coordinator.values())
+                with self.lock:
+                    dp_imbalance_range = max(self.load_balance_coordinator.values()) - min(self.load_balance_coordinator.values())
+                    max_rank = max(self.load_balance_coordinator, key=self.load_balance_coordinator.get)
+
                 if dp_imbalance_range >= rebalance_threshold:
                     # find the most loaded dp worker
-                    max_rank = max(self.load_balance_coordinator, key=self.load_balance_coordinator.get)
+
                     logger.info(f"Dynamic load balance: max dp rank {max_rank} load_balance_coordinator {self.load_balance_coordinator}")
                     # leftover = dp_imbalance_range - interrupt_cnt = rebalance_threshold /2
                     interrupt_cnt = int(dp_imbalance_range  -   rebalance_threshold / 2 )
@@ -691,7 +695,7 @@ class DynamicSamplingScheduler:
             original_request = self.requests_buffers[original_request_id]
             original_prompt_ids = original_request.batch["input_ids"]
             original_attention_mask = original_request.batch["attention_mask"]
-            original_prompt_length = original_attention_mask.sum().item()
+            original_prompt_length = original_prompt_ids.shape[1]
 
             # 2. Concatenate all partial token chunks from all interruptions.
             all_partial_tokens = []
@@ -719,7 +723,7 @@ class DynamicSamplingScheduler:
             
             # --- NEW ASSERTIONS to validate the fix ---
             expected_total_length = original_prompt_length + cumulative_partial_output_length
-            actual_total_length = continued_attention_mask.sum().item()
+            actual_total_length = continued_input_ids.shape[1]
             assert actual_total_length == expected_total_length, \
                 f"Assertion Failed: Reconstructed length mismatch. Expected {expected_total_length}, got {actual_total_length}"
             assert continued_input_ids.shape[1] == continued_attention_mask.shape[1], \
@@ -754,10 +758,15 @@ class DynamicSamplingScheduler:
             # Adjust max_new_tokens for the continued generation.
             generation_config = migrated_request.meta_info["generation_config"].copy()
             max_sequence_length = self.pipeline_config.sequence_length
-            safety_buffer = 4
-            max_allowed_new_tokens = max(1, max_sequence_length - actual_total_length - safety_buffer)
-            original_max_new_tokens = generation_config.get("max_new_tokens", 512)
-            generation_config["max_new_tokens"] = min(original_max_new_tokens, max_allowed_new_tokens)
+            original_max_new_tokens = generation_config["max_new_tokens"]
+
+            # Calculate remaining tokens from original request
+            remaining_from_original_request = original_max_new_tokens - cumulative_partial_output_length
+            # Calculate remaining space in sequence
+            remaining_sequence_space = max_sequence_length - actual_total_length
+            # Take minimum of both constraints
+            max_allowed_new_tokens =  min(remaining_from_original_request, remaining_sequence_space)
+            generation_config["max_new_tokens"] = max_allowed_new_tokens
             migrated_request.meta_info["generation_config"] = generation_config
                 
             # Reuse the original request ID for the resumed request.
@@ -776,180 +785,6 @@ class DynamicSamplingScheduler:
                 f"Successfully resumed prompt {prompt_id} to dp rank {target_dp_rank} with original request id {original_request_id}"
             )
 
-    def send_one_interrupted_query_group_to_dp(self, target_dp_rank: int):
-        """
-        Send interrupted query group to a target DP rank for continuation.
-        This method resends interrupted requests with their original input + partial output
-        concatenated as the new input, allowing the model to continue generation from
-        where it was interrupted while preserving the original request_id and metadata.
-        """
-        # assert False, "reroute not working now"
-        with self.lock:
-            # 1. get the request outputs from the interrupted buffer for one prompt
-            assert self.interrupted_query_group_buffers, "Migration: No interrupted query groups in buffer to migrate"
-
-            prompt_id, interrupted_batches = self.interrupted_query_group_buffers.popitem()
-            logger.info(
-                f"Migration: Migrating prompt_id {prompt_id} with {len(interrupted_batches)} batches to DP rank {target_dp_rank}")
-
-            old_dp_rank = None  # Initialize to track the original DP rank
-            successfully_migrated = 0  # Count successfully migrated requests
-
-            for i, processed_batch in enumerate(interrupted_batches):
-                pprint(processed_batch)
-                assert processed_batch.meta_info[
-                           "finish_status"] == "interrupted", "interrupted_batches should be interrupted"
-                # Keep the original request_id
-                original_request_id = processed_batch.meta_info["request_id"]
-
-                # Create migrated request with same request_id
-                migrated_request = DataProto()
-
-                # CRITICAL: For interrupted requests, we must build the continuation input correctly
-                # by reconstructing from the original input + partial output tokens.
-
-                # Get the original request to extract the original input_ids
-                if original_request_id not in self.requests_buffers:
-                    # Original request not found - skip this migration
-                    logger.error(f"Migration: Original request not found for {original_request_id}, skipping migration")
-                    assert False, f"Original request not found for {original_request_id}, skipping migration"
-
-
-                original_request = self.requests_buffers[original_request_id]
-                original_input_ids = original_request.batch["input_ids"]  # Original prompt tokens
-                logger.info(
-                    f"Migration: Found original request for {original_request_id}, input_shape={original_input_ids.shape}")
-
-                # Get partial output tokens from the processed response
-                partial_output_tokens = processed_batch.meta_info.get("output_token_ids", [])
-
-                if partial_output_tokens and len(partial_output_tokens) > 0 and len(partial_output_tokens[0]) > 0:
-                    # We have partial output, concatenate original input + partial output for continuation
-                    logger.info(
-                        f"Migration: Found partial output tokens for {original_request_id}: {len(partial_output_tokens[0])} tokens")
-
-                    # Build continuation input: original_input + partial_output
-                    partial_output_tensor = torch.tensor(partial_output_tokens[0], device=original_input_ids.device)
-                    continued_input_ids = torch.cat([original_input_ids.squeeze(0), partial_output_tensor],
-                                                    dim=0).unsqueeze(0)
-
-                    # Build corresponding attention mask and position_ids
-                    continued_seq_len = continued_input_ids.shape[1]
-                    continued_attention_mask = torch.ones((1, continued_seq_len), device=continued_input_ids.device,
-                                                          dtype=torch.long)
-                    continued_position_ids = torch.arange(continued_seq_len,
-                                                          device=continued_input_ids.device).unsqueeze(0)
-
-                    logger.info(f"Migration: Built continuation input for {original_request_id}: "
-                                f"original_len={original_input_ids.shape[1]}, partial_len={len(partial_output_tokens[0])}, "
-                                f"continued_len={continued_seq_len}")
-                    
-                    # **CRITICAL FIX**: Store the original prompt length for correct prompt extraction
-                    # This ensures postprocess_generate knows how to extract the original prompt correctly
-                    original_prompt_length = original_input_ids.shape[1]
-                    
-                else:
-                    # No partial output, just use original input
-                    logger.warning(
-                        f"Migration: No partial output found for interrupted request {original_request_id}, using original input")
-                    continued_input_ids = original_input_ids
-
-                    continued_attention_mask = original_request.batch["attention_mask"]
-                    continued_position_ids = original_request.batch.get("position_ids",
-                                                                        torch.arange(continued_input_ids.shape[1],
-                                                                                     device=continued_input_ids.device).unsqueeze(
-                                                                            0))
-                    original_prompt_length = original_input_ids.shape[1]
-
-                logger.info(f"Migration: Using continued input for request {original_request_id}: "
-                            f"continued_input_shape={continued_input_ids.shape}, max_token_id={continued_input_ids.max().item()}")
-
-                batch_tensors = {
-                    "input_ids": continued_input_ids,  # Original input + partial output for continuation
-                    "attention_mask": continued_attention_mask,
-                    "position_ids": continued_position_ids,
-                }
-
-                # Copy other tensor fields from the original request
-                source_batch = original_request.batch
-                for key in source_batch.keys():
-                    if key not in batch_tensors and key not in ["prompts"]:
-                        batch_tensors[key] = source_batch[key]
-                        logger.info(f"Migration: Copied tensor field '{key}' from original request.")
-
-                # **CRITICAL FIX**: Create a special "prompts" tensor that contains ONLY the original prompt
-                # This ensures consistent tensor shapes across normal and interrupted requests
-                batch_tensors["prompts"] = original_input_ids
-                logger.info(f"Migration: Set prompts tensor to original shape {original_input_ids.shape} for consistency")
-
-                # Create TensorDict
-                migrated_request.batch = TensorDict(source=batch_tensors, batch_size=(continued_input_ids.shape[0],))
-
-                # **FIX: Use original request's non_tensor_batch instead of processed_batch**
-                # The processed_batch might have incomplete or modified non_tensor_batch data
-                migrated_request.non_tensor_batch = copy.deepcopy(original_request.non_tensor_batch)
-
-                # Verify that the domain key exists in the original request
-                if "domain" not in original_request.non_tensor_batch:
-                    logger.error(f"Migration: 'domain' key missing in original request {original_request_id}")
-                    logger.error(
-                        f"Migration: Original request non_tensor_batch keys: {list(original_request.non_tensor_batch.keys())}")
-                    assert False, f"'domain' key missing in original request {original_request_id}"
-
-                logger.info(
-                    f"Migration: Copied non_tensor_batch from original request. Keys: {list(migrated_request.non_tensor_batch.keys())}")
-
-                # Keep original metadata but update callback and adjust generation config
-                assert processed_batch.meta_info['finish_status'] == "interrupted"
-                migrated_request.meta_info = processed_batch.meta_info.copy()
-                migrated_request.meta_info.pop('finish_status', None)
-                migrated_request.meta_info["response_callback_fn"] = self.response_callback_fn
-                
-                # **CRITICAL FIX**: Store metadata for postprocess_generate to handle correctly
-                migrated_request.meta_info["is_continued_request"] = True
-                migrated_request.meta_info["original_prompt_length"] = original_prompt_length
-                migrated_request.meta_info["partial_output_length"] = len(partial_output_tokens[0]) if partial_output_tokens and len(partial_output_tokens) > 0 and len(partial_output_tokens[0]) > 0 else 0
-
-                # Adjust max_new_tokens for continued generation
-                generation_config = migrated_request.meta_info["generation_config"].copy()
-                current_input_length = continued_input_ids.shape[1]
-                max_sequence_length = self.pipeline_config.sequence_length
-                safety_buffer = 4
-                max_allowed_new_tokens = max_sequence_length - current_input_length - safety_buffer
-                original_max_new_tokens = generation_config.get("max_new_tokens", 512)
-                adjusted_max_new_tokens = max(1, min(original_max_new_tokens, max_allowed_new_tokens))
-                generation_config["max_new_tokens"] = adjusted_max_new_tokens
-                migrated_request.meta_info["generation_config"] = generation_config
-                logger.info(f"Migration: max_new_tokens for request {original_request_id}: "
-                            f"original={original_max_new_tokens}, adjusted={adjusted_max_new_tokens}")
-
-                migrated_request.non_tensor_batch = processed_batch.non_tensor_batch.copy()
-                assert "domain" in processed_batch.non_tensor_batch.keys(), f"{prompt_id=} {original_request_id=} processed_batch.non_tensor_batch keys: {list(processed_batch.non_tensor_batch.keys())} should contain domain"
-                assert "domain" in migrated_request.non_tensor_batch.keys(), f"{prompt_id=} {original_request_id=} batch.non_tensor_batch keys: {list(migrated_request.non_tensor_batch.keys())} should contain domain"
-
-                # Update bookkeeping data structures
-
-                old_dp_rank = self.request_id_2_dp_rank[original_request_id]
-                self.request_id_2_dp_rank[original_request_id] = target_dp_rank
-                self.load_balance_coordinator[target_dp_rank] += 1
-                self.requests_buffers[original_request_id] = migrated_request
-                logger.info(f"Migration: Added migrated request {original_request_id} to DP rank {target_dp_rank}")
-                # Send to new DP worker
-                self.actor_cluster.workers[target_dp_rank].add_request.remote(
-                    command=GenerateRequestType.ADD, data=migrated_request
-                )
-
-                migrated_request.meta_info.pop("response_callback_fn", None)
-                successfully_migrated += 1
-
-            if successfully_migrated == 0:
-                logger.error(f"Migration: Failed to migrate any requests for prompt_id {prompt_id} - all were skipped.")
-                assert False, "Failed to migrate any requests for prompt_id {prompt_id} - all were skipped."
-                return 0
-
-            logger.info(
-                f"Migration: Successfully migrated {successfully_migrated} out of {len(interrupted_batches)} requests for prompt_id {prompt_id} from rank {old_dp_rank} to rank {target_dp_rank}")
-            return successfully_migrated
 
     def interrupt_all_requests_by_dp_rank(self, interrupted_rank):
         # assert False, "Migration: interrupt_all_requests_by_dp_rank is not implemented yet"
@@ -1291,11 +1126,12 @@ class DynamicSamplingScheduler:
     def get_available_dp_rank(self):
         while True:
             # 负载均衡逻辑，期望各dp 正在处理的条数基本接近
-            sorted_ranks = sorted(
-                self.load_balance_coordinator.keys(), key=lambda rank: (self.load_balance_coordinator[rank], rank)
-            )
-            if self.load_balance_coordinator[sorted_ranks[0]] < self.max_running_requests:
-                yield sorted_ranks[0]
+            with self.lock:
+                sorted_ranks = sorted(
+                    self.load_balance_coordinator.keys(), key=lambda rank: (self.load_balance_coordinator[rank], rank)
+                )
+                if self.load_balance_coordinator[sorted_ranks[0]] < self.max_running_requests:
+                    yield sorted_ranks[0]
 
 
 @ray.remote
