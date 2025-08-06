@@ -412,71 +412,116 @@ class VllmStrategy(InferenceStrategy):
                             interrupted_rid_set.add(request_id)
                         else:
                             logger.warning(f"interrupt request {request_id=} command received but not in request_metas: {self.request_metas.keys()} perhaps already finished")
-                    if target_leftover_cnt:
-                        # interrupt requests up to the point of target_leftover_cnt,
-                        # sort request by the overhead of migration and find the easiest to interrupt
-                        
-                        # Get current request counts from vLLM scheduler
-                        # Access the first scheduler (assuming single GPU scheduling)
-                        scheduler = self.model.llm_engine.scheduler[0]
-                        
-                        # Count requests in different queues
-                        waiting_count = len(scheduler.waiting)
-                        running_count = len(scheduler.running)
-                        total_count = waiting_count + running_count
-                        
-                        # Calculate how many requests to interrupt
-                        interrupt_count = total_count - target_leftover_cnt
-                        
-                        if interrupt_count <= 0:
-                            logger.info(f"No interruption needed: total_count={total_count}, target_leftover={target_leftover_cnt}")
-                            continue
-                            
-                        logger.info(f"Dynamic load balance: need to interrupt {interrupt_count} requests "
-                                   f"(waiting={waiting_count}, running={running_count}, target_leftover={target_leftover_cnt})")
-                        
-                        requests_to_interrupt = []
-                        
-                        # Step 1: First interrupt all waiting (unscheduled) requests
-                        if waiting_count > 0:
-                            for seq_group in scheduler.waiting:
-                                if len(requests_to_interrupt) >= interrupt_count:
-                                    break
-                                request_id = seq_group.request_id
-                                assert request_id in self.request_metas, f"request_id {request_id} not found in request_metas buffer "
-                                requests_to_interrupt.append(request_id)
 
-                        
-                        # Step 2: If we still need to interrupt more, select from running requests
-                        if len(requests_to_interrupt) < interrupt_count:
-                            # Calculate total sequence length for each running request
-                            running_requests_with_length = []
+                    if target_leftover_cnt:
+                        # Check if we have the v1 engine
+                        if hasattr(self.model.llm_engine, 'engine_core'):
+                            # Use v1 engine's collective_rpc to call abort_to_target_requests_cnt
+                            logger.info(f"Using v1 engine abort_to_target_requests_cnt with target={target_leftover_cnt}")
+
+                            # Use collective_rpc to call the method on the engine core
+                            results = self.model.llm_engine.collective_rpc(
+                                method='abort_to_target_requests_cnt',
+                                args=(target_leftover_cnt,)
+                            )
+                            # collective_rpc returns a list of results (one per worker)
+                            # Flatten the results and add to interrupted set
+                            if results and isinstance(results[0], list):
+                                for interrupted_rids in results:
+                                    interrupted_rid_set.update(interrupted_rids)
+                            logger.info(f"V1 engine interrupted {len(interrupted_rid_set)} requests")
+                            # Note: We can't track which specific requests were interrupted in v1
+                            logger.info(f"V1 engine processed interruption to target count {target_leftover_cnt}")
+
+                        else:
+                            # Fallback for v0 engine - use original implementation
+                            # interrupt requests up to the point of target_leftover_cnt,
+                            # sort request by the overhead of migration and find the easiest to interrupt
                             
-                            for seq_group in scheduler.running:
+                            # Get current request counts from vLLM engine stats
+                            stats = self.model.llm_engine._get_stats(scheduler_outputs=None)
+                            
+                            # Count requests in different queues
+                            waiting_count = stats.num_waiting_sys
+                            running_count = stats.num_running_sys
+                            swapped_count = stats.num_swapped_sys
+                            total_count = waiting_count + running_count + swapped_count
+                            
+                            # Calculate how many requests to interrupt
+                            interrupt_count = total_count - target_leftover_cnt
+                            
+                            if interrupt_count <= 0:
+                                logger.info(f"No interruption needed: total_count={total_count}, target_leftover={target_leftover_cnt}")
+                                continue
+                                
+                            logger.info(f"Dynamic load balance: need to interrupt {interrupt_count} requests "
+                                       f"(waiting={waiting_count}, running={running_count}, swapped={swapped_count}, "
+                                       f"target_leftover={target_leftover_cnt})")
+                            
+                            # Get the scheduler to access request queues
+                            scheduler = self.model.llm_engine.scheduler[0]
+                            
+                            # Get all requests from queues
+                            waiting_requests = list(scheduler.waiting)
+                            swapped_requests = list(scheduler.swapped)
+                            running_requests = list(scheduler.running)
+                            
+                            # Merge swapped and running requests and sort by total length (shortest first)
+                            swapped_and_running = []
+                            
+                            # Add swapped requests
+                            for seq_group in swapped_requests:
                                 request_id = seq_group.request_id
                                 assert request_id in self.request_metas, f"request_id {request_id} not found in request_metas buffer"
-                                    
+                                
                                 # Calculate total sequence length (prompt + generated tokens)
                                 total_length = 0
                                 for seq in seq_group.get_seqs():
                                     total_length += seq.get_len()
                                 
-                                running_requests_with_length.append((request_id, total_length, seq_group))
-                                
-                            # Sort by total length (ascending) - interrupt shortest sequences first
-                            running_requests_with_length.sort(key=lambda x: x[1])
+                                swapped_and_running.append((request_id, total_length, 'swapped', seq_group))
                             
-                            # Select additional requests to interrupt
-                            remaining_to_interrupt = interrupt_count - len(requests_to_interrupt)
-                            for request_id, total_length, seq_group in running_requests_with_length[:remaining_to_interrupt]:
+                            # Add running requests
+                            for seq_group in running_requests:
+                                request_id = seq_group.request_id
+                                assert request_id in self.request_metas, f"request_id {request_id} not found in request_metas buffer"
+                                
+                                # Calculate total sequence length (prompt + generated tokens)
+                                total_length = 0
+                                for seq in seq_group.get_seqs():
+                                    total_length += seq.get_len()
+                                
+                                swapped_and_running.append((request_id, total_length, 'running', seq_group))
+                            
+                            # Sort by total length (ascending) - interrupt shortest sequences first
+                            swapped_and_running.sort(key=lambda x: x[1])
+                            
+                            # Concatenate all requests in priority order: waiting -> (swapped+running sorted by length)
+                            all_requests_ordered = []
+                            all_requests_ordered.extend([(sg.request_id, 'waiting', sg) for sg in waiting_requests])
+                            all_requests_ordered.extend([(rid, status, sg) for rid, _, status, sg in swapped_and_running])
+                            
+                            # Select requests to interrupt using while loop
+                            requests_to_interrupt = []
+                            idx = 0
+                            
+                            while len(requests_to_interrupt) < interrupt_count and idx < len(all_requests_ordered):
+                                request_id, status, seq_group = all_requests_ordered[idx]
                                 requests_to_interrupt.append(request_id)
-                                logger.info(f"Selected running request {request_id} for interruption (total_length={total_length})")
-                        
-                        # Step 3: Abort the selected requests
-                        for request_id in requests_to_interrupt:
-                            logger.info(f"Interrupting request {request_id}")
-                            self.model.abort_request(request_id=request_id)
-                            interrupted_rid_set.add(request_id)
+                                
+                                if status == 'running':
+                                    total_length = sum(seq.get_len() for seq in seq_group.get_seqs())
+                                    logger.info(f"Selected {status} request {request_id} for interruption (total_length={total_length})")
+                                else:
+                                    logger.info(f"Selected {status} request {request_id} for interruption")
+                                
+                                idx += 1
+                            
+                            # Step 3: Abort the selected requests
+                            for request_id in requests_to_interrupt:
+                                logger.info(f"Interrupting request {request_id}")
+                                self.model.abort_request(request_id=request_id)
+                                interrupted_rid_set.add(request_id)
 
 
                 elif command == GenerateRequestType.STOP:
