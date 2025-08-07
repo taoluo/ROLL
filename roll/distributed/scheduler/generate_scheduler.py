@@ -336,7 +336,7 @@ class GenerateScheduler:
 
 
 # @ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
-@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 1})
+@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
 class DynamicSamplingScheduler:
 
     def __init__(self, pipeline_config=None):
@@ -462,8 +462,8 @@ class DynamicSamplingScheduler:
             logger.info(f"Connecting PyCharm debugger on port {debug_port}")
             if os.getenv("PYCHARM", "0") == "1":
                 pydevd_pycharm.settrace('localhost', port=debug_port, stdoutToServer=True, stderrToServer=True, suspend=False)
-            logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
-            print(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
+                logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
+
 
 
     def reset_status(self):
@@ -558,11 +558,11 @@ class DynamicSamplingScheduler:
                 req_bf = set(self.requests_buffers.keys())
                 callback_request_ids = req_bf - self.abort_request_ids
                 if not callback_request_ids:
-                    logger.info(f"requests callback buffers empty {req_bf=} - {self.abort_request_ids=} , sleep 5 sec to finish all requests and break")
-                    time.sleep(5)
                     buffer_len = len(self.completed_buffers)
-                    logger.info(f"buffer len {buffer_len} before break ")
-                    break
+                    logger.info(f"requests callback buffers empty {req_bf=} - {self.abort_request_ids=} , buffer len {buffer_len}, sleep 5 sec to finish all requests shall finish loop soon, ")
+                    time.sleep(5)
+
+
                 else:
 
                     logger.info(f"buffer is not empty, {callback_request_ids=}, sleep 1 sec")
@@ -608,7 +608,7 @@ class DynamicSamplingScheduler:
 
         completed_buffers = {k: v for k, v in self.completed_buffers.items() if len(v) > 0}
         collect_data = [item for sublist in list(completed_buffers.values())[:] for item in sublist]
-        assert len(collect_data) > 0, "No collect data found, check if the dataset is empty or all requests are filtered out."
+        assert len(collect_data) > 0, f"No collect data found, check if the dataset is empty or all requests are filtered out. {self.completed_buffers}"
         # **LOG ALL INDIVIDUAL REQUESTS**: Before concatenation, log each request's detailed info
         logger.info(f"SCHEDULER_COLLECT_DATA: Found {len(collect_data)} total responses from {len(completed_buffers)} queries")
         for i, data_item in enumerate(collect_data):
@@ -944,7 +944,7 @@ class DynamicSamplingScheduler:
             # call reward
             # reward worker得能支持单条数据计算, dynamic sampling对需要batch计算reward的需要注意...
             # 多域的时候,llm as judge, 需要单独为reward worker分配gpu
-            rewards: DataProto = ray.get(reward_worker.compute_rewards.remote(batch))
+            rewards: DataProto = ray.get(reward_worker.compute_rewards.remote(batch),timeout=30)
             batch.union(rewards)
 
             response_buffers: List[DataProto] = []
@@ -1324,7 +1324,7 @@ class RequestScheduler:
             # call reward
             # reward worker得能支持单条数据计算, dynamic sampling对需要batch计算reward的需要注意...
             # 多域的时候,llm as judge, 需要单独为reward worker分配gpu
-            rewards: DataProto = ray.get(reward_worker.compute_rewards.remote(batch))
+            rewards: DataProto = ray.get(reward_worker.compute_rewards.remote(batch), timeout=30)
             batch.union(rewards)
 
             response_buffers: List[DataProto] = []

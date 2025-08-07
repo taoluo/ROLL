@@ -67,7 +67,7 @@ class ActorWorker(Worker):
         self.logger.info(f"Connecting PyCharm debugger on port {debug_port}")
         if os.getenv("PYCHARM", "0") == "1":
             pydevd_pycharm.settrace('localhost', port=debug_port, stdoutToServer=True, stderrToServer=True, suspend=False)
-        self.logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
+            self.logger.info(f"PyCharm debugger attached to {scheduler_type} scheduler on port {debug_port}")
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step(self, data: DataProto):
@@ -397,7 +397,13 @@ class ActorWorker(Worker):
         # tao perhaps not call it untill finishes.
 
         response_call_back_fn = self.response_call_back_fns.pop(data.meta_info["request_id"])
-        self.response_callback_refs.append(response_call_back_fn(data))
+        call = response_call_back_fn(data)
+        # shall not block too long here
+        read_res, _ = ray.wait([call], timeout=5.0)
+        if len(read_res) == 0:
+            self.logger.warning(f"response callback on report_response for {data.meta_info['request_id']} is not finished in 5s, "
+                                )
+        self.response_callback_refs.append(call)
 
 
 class CriticWorker(Worker):
