@@ -404,14 +404,13 @@ class VllmStrategy(InferenceStrategy):
                 elif command == GenerateRequestType.INTERRUPT:
                     request_id = batch.meta_info.get("request_id", None)
                     target_leftover_cnt = batch.meta_info.get("target_leftover_cnt", None)
-                    assert request_id is None ^ target_leftover_cnt is None, f"they are exclusive but got {request_id=} {target_leftover_cnt=}"
+                    assert (request_id is None) ^ (target_leftover_cnt is None), f"they are exclusive but got {request_id=} {target_leftover_cnt=}"
                     if request_id:
-                        if request_id in self.request_metas:
-                            logger.info(f"interrupt request command sent to backend engine")
-                            self.model.abort_request(request_id=request_id)
-                            interrupted_rid_set.add(request_id)
-                        else:
-                            logger.warning(f"interrupt request {request_id=} command received but not in request_metas: {self.request_metas.keys()} perhaps already finished")
+                        assert request_id in self.request_metas, f"request_id {request_id} not in request_metas {self.request_metas.keys()}"
+                        logger.info(f"interrupt request command sent to backend engine")
+                        self.model.abort_request(request_id=request_id)
+                        interrupted_rid_set.add(request_id)
+
 
                     if target_leftover_cnt:
                         # Check if we have the v1 engine
@@ -426,10 +425,12 @@ class VllmStrategy(InferenceStrategy):
                             )
                             # collective_rpc returns a list of results (one per worker)
                             # Flatten the results and add to interrupted set
-                            if results and isinstance(results[0], list):
-                                for interrupted_rids in results:
-                                    interrupted_rid_set.update(interrupted_rids)
-                            logger.info(f"V1 engine interrupted {len(interrupted_rid_set)} requests")
+
+                            assert isinstance(results, list), f"result from collective_rpc should be a list, got {type(results)}"
+                            for interrupted_rids in results:
+                                assert interrupted_rids in self.request_metas, f"interrupted_rids {interrupted_rids} not in request_metas {self.request_metas.keys()}"
+                                interrupted_rid_set.update(interrupted_rids)
+                            logger.info(f"V1 engine interrupted {len(interrupted_rid_set)} requests  {interrupted_rid_set}" )
                             # Note: We can't track which specific requests were interrupted in v1
                             logger.info(f"V1 engine processed interruption to target count {target_leftover_cnt}")
 
