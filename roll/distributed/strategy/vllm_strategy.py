@@ -423,13 +423,12 @@ class VllmStrategy(InferenceStrategy):
                                 method='abort_to_target_requests_cnt',
                                 args=(target_leftover_cnt,)
                             )
-                            # collective_rpc returns a list of results (one per worker)
-                            # Flatten the results and add to interrupted set
-
-                            assert isinstance(results, list), f"result from collective_rpc should be a list, got {type(results)}"
-                            for interrupted_rids in results:
-                                assert interrupted_rids in self.request_metas, f"interrupted_rids {interrupted_rids} not in request_metas {self.request_metas.keys()}"
-                                interrupted_rid_set.update(interrupted_rids)
+                            # collective_rpc returns a list of results of interrupted requet id or None if no request was interrupted
+                            if results is not None:
+                                assert isinstance(results, list), f"result from collective_rpc should be a list, got {type(results)}"
+                                for interrupted_rids in results:
+                                    assert interrupted_rids in self.request_metas, f"interrupted_rids {interrupted_rids} not in request_metas {self.request_metas.keys()}"
+                                    interrupted_rid_set.update(interrupted_rids)
                             logger.info(f"V1 engine interrupted {len(interrupted_rid_set)} requests  {interrupted_rid_set}" )
                             # Note: We can't track which specific requests were interrupted in v1
                             logger.info(f"V1 engine processed interruption to target count {target_leftover_cnt}")
