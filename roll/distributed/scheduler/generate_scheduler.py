@@ -505,7 +505,7 @@ class DynamicSamplingScheduler:
         num_return_sequences = self.generation_config["num_return_sequences"]
 
         enable_dynamic_lb = True # enable dynamic load balance, if False, we will not check dp worker load and interrupt requests
-        rebalance_threshold = 10 # rebalance threshold, if the dp worker load difference is larger than this value, we will interrupt some requests
+        rebalance_threshold = 1 # rebalance threshold, if the dp worker load difference is larger than this value, we will interrupt some requests
 
         last_interruption_time = None
         freeze_interruption_timeout = 3  # after each interruption, wait 3 seconds to update load balancer from scheduler before check rebalance threshold
@@ -584,6 +584,7 @@ class DynamicSamplingScheduler:
             request_data_list = self.expand_requests(request_data)
 
             dp_rank = next(self.get_available_dp_rank())
+            dp_rank = 0
             with self.lock:
                 self.prompt_use_count += 1
                 self.running_prompts += 1
