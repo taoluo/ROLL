@@ -335,7 +335,6 @@ class GenerateScheduler:
             self.is_completed = True
 
 
-# @ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
 @ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
 class DynamicSamplingScheduler:
 
@@ -576,11 +575,11 @@ class DynamicSamplingScheduler:
             # dataset_item = self.get_next_dataset_item()  # Use different dataset items
             # tao: rvst hardcode for testing debug interrupt, remove this later
             # dataset_item = self.get_fixed_dataset_item(0)  # This was causing identical input_ids!
-            
+
             domain = dataset_item.get("domain", "default")
             collect_data = self.collect_fn([dataset_item])
             request_data: DataProto = DataProto.from_single_dict(collect_data, meta_info=data.meta_info)
-            
+
             # replica, redundancy
             request_data_list = self.expand_requests(request_data)
 
@@ -618,24 +617,24 @@ class DynamicSamplingScheduler:
             migration_count = data_item.meta_info.get("migration_count", 0)
             original_request_id = data_item.meta_info.get("original_request_id", request_id)
             domain = data_item.non_tensor_batch.get("domain", ["UNKNOWN"])[0] if "domain" in data_item.non_tensor_batch else "UNKNOWN"
-            
+
             # Decode prompt and response for logging
             if "prompts" in data_item.batch:
                 prompt_text = self.tokenizer.decode(data_item.batch["prompts"][0], skip_special_tokens=True)
             else:
                 prompt_text = "NO_PROMPT_IN_BATCH"
-            
+
             if "responses" in data_item.batch:
                 response_text = self.tokenizer.decode(data_item.batch["responses"][0], skip_special_tokens=True)
                 response_length = len(data_item.batch["responses"][0])
             else:
                 response_text = "NO_RESPONSE_IN_BATCH"
                 response_length = 0
-            
+
             logger.info(f"COLLECT_request_id={request_id}, original_id={original_request_id}, domain={domain}, is_continued={is_continued}, migrations={migration_count}, finish_status={finish_status}, response_length={response_length}")
             logger.info(f"COLLECT_PROMPT_{request_id}: \n{prompt_text}")
             logger.info(f"COLLECT_RESPONSE_{request_id}: \n{response_text}")
-        
+
         query_use_count = next(prompt_id_counter)
         logger.info(
             f"total collect data: {len(collect_data)}, collect queries: {len(completed_buffers)} "
@@ -711,14 +710,14 @@ class DynamicSamplingScheduler:
                     )
                 if partial_tokens and len(partial_tokens) > 0 and len(partial_tokens[0]) > 0:
                     all_partial_tokens.extend(partial_tokens[0])
-            
+
             cumulative_partial_output_length = len(all_partial_tokens)
 
             # 3. Build the new, fully continued input.
             if cumulative_partial_output_length > 0:
                 partial_output_tensor = torch.tensor(all_partial_tokens, device=original_prompt_ids.device)
                 continued_input_ids = torch.cat([original_prompt_ids.squeeze(0), partial_output_tensor], dim=0).unsqueeze(0)
-                
+
                 # Extend the attention mask to cover the new tokens.
                 partial_output_mask = torch.ones((1, cumulative_partial_output_length), device=original_prompt_ids.device, dtype=torch.long)
                 continued_attention_mask = torch.cat([original_attention_mask, partial_output_mask], dim=1)
@@ -728,7 +727,7 @@ class DynamicSamplingScheduler:
                 continued_attention_mask = original_attention_mask
 
             continued_position_ids = torch.arange(continued_input_ids.shape[1], device=continued_input_ids.device).unsqueeze(0)
-            
+
             # --- NEW ASSERTIONS to validate the fix ---
             expected_total_length = original_prompt_length + cumulative_partial_output_length
             actual_total_length = continued_input_ids.shape[1]
@@ -741,7 +740,7 @@ class DynamicSamplingScheduler:
             #    Use metadata from the *last* interrupted batch as it's the most recent.
             last_batch = interrupted_batches[-1]
             migrated_request = DataProto()
-            
+
             batch_tensors = {
                     "input_ids": continued_input_ids,
                     "attention_mask": continued_attention_mask,
@@ -751,7 +750,7 @@ class DynamicSamplingScheduler:
             for key in original_request.batch.keys():
                 if key not in batch_tensors:
                     batch_tensors[key] = original_request.batch[key]
-            
+
             migrated_request.batch = TensorDict(source=batch_tensors, batch_size=[1])
             migrated_request.non_tensor_batch = copy.deepcopy(original_request.non_tensor_batch)
 
@@ -776,7 +775,7 @@ class DynamicSamplingScheduler:
             max_allowed_new_tokens =  min(remaining_from_original_request, remaining_sequence_space)
             generation_config["max_new_tokens"] = max_allowed_new_tokens
             migrated_request.meta_info["generation_config"] = generation_config
-                
+
             # Reuse the original request ID for the resumed request.
             migrated_request.meta_info["request_id"] = original_request_id
 
@@ -997,7 +996,7 @@ class DynamicSamplingScheduler:
         """Fixed dataset item for testing - always returns the same item"""
         dataset_item = self.dataset[dataset_index]
         logger.info(f"FIXED_DATASET_DEBUG: Using fixed dataset item at index {dataset_index}")
-        
+
         # Log the fixed dataset item details
         for key in ['prompt', 'text', 'messages', 'ground_truth', 'input_ids']:
             if key in dataset_item:
@@ -1008,7 +1007,7 @@ class DynamicSamplingScheduler:
                 else:
                     sample_text = str(data)[:100] if data else "None"
                     logger.info(f"FIXED_DATASET_DEBUG: {key}_sample='{sample_text}'")
-        
+
         return dataset_item
 
     def get_next_dataset_item(self):
@@ -1022,7 +1021,7 @@ class DynamicSamplingScheduler:
             item_index = next(self.dataset_iter)
             logger.info(f"Dataset length: {len(self.dataset)}, retrieving get_next_dataset_item at index: {item_index}")
             dataset_item = self.dataset[item_index]
-            
+
             # dataset_item = self.dataset[next(self.dataset_iter)]
             # tao: rvst hardcode for testing debug interrupt, remove this later
             # dataset_item = self.dataset[0]
@@ -1248,17 +1247,17 @@ class RequestScheduler:
             with self.lock:
                 if data.meta_info["finish_status"] == "interrupted":
                     # **ENHANCED LOGGING**: Track prompt length and output lengths for interrupted requests
-                    
+
                     # Get the original request to analyze lengths
                     original_request = self.requests_buffers.get(request_id, None)
                     original_prompt_length = 0
                     cumulative_partial_output_length = 0
                     migration_count = 0
-                    
+
                     if original_request:
                         original_input_ids = original_request.batch["input_ids"]
                         concatenated_input_length = original_input_ids.shape[1]
-                        
+
                         # Check if this is a continued request
                         is_continued_request = original_request.meta_info.get("is_continued_request", False)
                         if is_continued_request:
@@ -1269,20 +1268,20 @@ class RequestScheduler:
                         else:
                             # For original requests, the input length is the original prompt length
                             original_prompt_length = concatenated_input_length
-                    
+
                     # Get the newly generated output tokens from this interruption
                     output_token_ids = data.meta_info.get("output_token_ids", [])
                     newly_generated_length = 0
                     if output_token_ids and len(output_token_ids) > 0 and len(output_token_ids[0]) > 0:
                         newly_generated_length = len(output_token_ids[0])
-                    
+
                     # Single comprehensive log entry
                     logger.info(f"Migration: BUFFERING interrupted request {request_id}: "
                                f"original_prompt_length={original_prompt_length}, "
                                f"cumulative_partial_output_length={cumulative_partial_output_length}, "
                                f"newly_generated_length={newly_generated_length}, "
                                f"migration_count={migration_count}")
-                    
+
                     self.interrupted_query_group_buffers[prompt_id].append(data)
                     logger.info(
                         f"Migration: Added interrupted batch for prompt_id {prompt_id} to buffer {list(self.interrupted_query_group_buffers.keys())}")

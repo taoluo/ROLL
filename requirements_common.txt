@@ -23,6 +23,7 @@ codetiming
 more_itertools
 
 wandb
+swanlab
 
 math-verify
 openai
@@ -38,3 +39,5 @@ latex2sympy2_extended==1.10.1
 antlr4-python3-runtime==4.9.3
 
 ./mcore_adapter
+
+-r requirements_vision.txt
