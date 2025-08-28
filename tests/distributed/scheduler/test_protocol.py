@@ -4,6 +4,7 @@ import numpy as np
 from tensordict import TensorDict
 
 from roll.distributed.scheduler.protocol import DataProto, custom_np_concatenate
+from roll.utils.functionals import reduce_metrics
 
 
 @pytest.fixture
@@ -140,6 +141,8 @@ def test_concat_global_keys_dict():
     )
 
 
+
+
 def test_concat_global_keys_scalar():
     """Test scalar metrics aggregation."""
     dp0 = DataProto.from_single_dict(
@@ -173,8 +176,53 @@ def test_concat_empty_global_keys():
         {"dummy": torch.randn(1)}, meta_info={"metrics": {"a": 2}}
     )
     merged = DataProto.concat([dp0, dp1])  # no global_keys provided
-    assert merged.meta_info["metrics"]["a"] == 1
+    np.testing.assert_array_equal(merged.meta_info["metrics"]["a"], [1, 2])
 
+def test_concat_global_keys_dict_missing_subkeys():
+    """
+    Test dict-valued metrics aggregation when some ranks have missing sub-keys.
+    Ensures missing keys are skipped (not filled with None) and calculations like np.mean work.
+    """
+    # Rank 0: has both acc and loss
+    dp0 = DataProto.from_single_dict(
+        {"x": torch.randn(2)},
+        meta_info={"metrics": {"acc": 0.8, "loss": np.array([0.1, 0.2])}}
+    )
+    # Rank 1: missing acc
+    dp1 = DataProto.from_single_dict(
+        {"x": torch.randn(1)},
+        meta_info={"metrics": {"loss": np.array([0.15])}}
+    )
+    # Rank 2: has acc and extra precision, missing loss
+    dp2 = DataProto.from_single_dict(
+        {"x": torch.randn(2)},
+        meta_info={"metrics": {"acc": 0.9, "precision": np.array([0.7, 0.75])}}
+    )
+
+    # Merge all ranks, aggregate metrics across them
+    merged = DataProto.concat([dp0, dp1, dp2], global_keys={"metrics"})
+    metrics = merged.meta_info["metrics"]
+
+    # 1. Total batch length = 2 + 1 + 2 = 5
+    assert len(merged) == 5
+
+    # 2. Check merged keys
+    assert set(metrics.keys()) == {"acc", "loss", "precision"}
+
+    # 3. Validate individual metric arrays
+    expected_loss = np.array([0.1, 0.2, 0.15])  # Rank 0 (2x) + Rank 1 (1x)
+    expected_acc = np.array([0.8, 0.9])         # Rank 0 (1x) + Rank 2 (1x)
+    expected_precision = np.array([0.7, 0.75])  # Rank 2 (2x)
+
+    np.testing.assert_array_equal(metrics["loss"], expected_loss)
+    np.testing.assert_array_equal(metrics["acc"], expected_acc)
+    np.testing.assert_array_equal(metrics["precision"], expected_precision)
+
+    # 4. Reduce metrics (using project function) and check mean calculation
+    reduced = reduce_metrics(metrics)
+    assert np.isclose(reduced["loss"], expected_loss.mean())
+    assert np.isclose(reduced["acc"], expected_acc.mean())
+    assert np.isclose(reduced["precision"], expected_precision.mean())
 
 
 if __name__ == "__main__":

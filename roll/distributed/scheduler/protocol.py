@@ -87,14 +87,26 @@ def union_numpy_dict(tensor_dict1: dict[np.ndarray], tensor_dict2: dict[np.ndarr
 
 
 def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
-    if len(list_of_dict) == 0:
+    """
+    Convert a list of dictionaries into a dictionary of lists.
+
+    Example:
+        Input:  [{"a": 1, "b": 2}, {"a": 3}, {"b": 4}]
+        Output: {"a": [1, 3], "b": [2, 4]}
+
+    Only keys present in each dictionary are aggregated.
+    Missing keys in a dictionary are simply skipped.
+    """
+    if not list_of_dict:
         return {}
-    keys = list_of_dict[0].keys()
-    output = {key: [] for key in keys}
-    for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+
+    output = {}
+    for d in list_of_dict:
+        if not isinstance(d, dict):
+            raise TypeError(f"Expected dict, but got {type(d)}: {d}")
+        for k, v in d.items():
+            output.setdefault(k, []).append(v)
+
     return output
 
 
