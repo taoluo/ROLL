@@ -454,6 +454,67 @@ class McaValueModel(GPTModel, PretrainedModel):
         
         return missing_keys, unexpected_keys
     
+    @classmethod
+    def from_pretrained(
+        cls, model_name_or_path: str, args: "TrainingArguments" = None, use_cpu_initialization: bool = False
+    ) -> "VirtualModels":
+        """
+        Override from_pretrained to handle missing value_head.weight gracefully.
+        This allows loading from GPT checkpoints that don't have the value head.
+        """
+        load_start_time = time.time()
+        config = cls.config_class.from_pretrained(model_name_or_path, args)
+        config.use_cpu_initialization = use_cpu_initialization
+        models = VirtualModels(cls, config=config)
+
+        logger.info(
+            f"number of parameters on (tensor, pipeline, expert) model parallel rank "
+            f"({mpu.get_tensor_model_parallel_rank()}, {mpu.get_pipeline_model_parallel_rank()}, "
+            f"{mpu.get_expert_model_parallel_rank()}): {sum(p.nelement() for p in models.parameters())}"
+        )
+
+        mca_ckpt_exist = exists_mca_config(model_name_or_path)
+        dist_config_match = False
+        if mca_ckpt_exist:
+            old_mca_config = cls.config_class.from_pretrained(model_name_or_path)
+            dist_config_match = config.distribute_config_match(old_mca_config)
+
+        if mca_ckpt_exist and dist_config_match:
+            state_dict = load_state_dict_from_checkpoint(model_name_or_path)
+            models.load_state_dict(state_dict)
+        else:
+            if not exists_hf_config(model_name_or_path):
+                raise ValueError(
+                    f"{model_name_or_path} is not valid for current training, because not exists hf ckpt "
+                    f"and not mca_ckpt_exist: {mca_ckpt_exist} or not dist_config_match: {dist_config_match}"
+                )
+            state_dict = {}
+            converter = ModelConverter(config, model_name_or_path=model_name_or_path)
+            for i in range(len(models)):
+                key = "model"
+                if len(models) > 1:
+                    mpu.set_virtual_pipeline_model_parallel_rank(i)
+                    key = f"{key}{i}"
+                state_dict[key] = converter.load_mca_state_dict_from_hf()
+            missing_keys, unexpected_keys = models.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                missing_keys = [key for key in missing_keys if not key.endswith("._extra_state")]
+            if unexpected_keys and config.tie_embeddings_and_output_weights:
+                unexpected_keys = [key for key in unexpected_keys if not key.endswith("output_layer.weight")]
+            
+            # For McaValueModel, filter out expected missing value_head weights
+            if missing_keys:
+                value_head_missing = [key for key in missing_keys if "value_head" in key]
+                other_missing = [key for key in missing_keys if "value_head" not in key]
+                if value_head_missing:
+                    logger.info(f"Expected missing keys for value model (will be randomly initialized): {value_head_missing}")
+                missing_keys = other_missing  # Only check non-value_head missing keys
+            
+            assert unexpected_keys is None or len(unexpected_keys) == 0, f"unexpected_keys: {unexpected_keys}"
+            assert missing_keys is None or len(missing_keys) == 0, f"missing_keys: {missing_keys}"
+        logger.info(f"End loading, cost: {time.time() - load_start_time:0.3f}s")
+        return models
+    
     def _get_transformer_layer_spec(self, config: Optional["McaModelConfig"]=None):
         """Reuse the same transformer layer spec as McaGPTModel."""
         config = config or self.config

@@ -417,6 +417,7 @@ def test_virtual_pipeline():
   - [ ] Implement state_dict_for_save_checkpoint
   - [ ] Implement save_pretrained for HuggingFace compatibility
   - [ ] Implement load_state_dict with missing key handling
+  - [ ] Override from_pretrained to handle missing value_head.weight from GPT checkpoints
 
 - [ ] **Update default_value_model_provider in model_providers.py**
   - [ ] Add Megatron branch with monkey-patching
@@ -498,7 +499,9 @@ def test_virtual_pipeline():
 
 ### 9.1 Checkpoint Compatibility
 - **Issue**: Loading from GPT checkpoint missing value_head weights
-- **Solution**: Override load_state_dict to filter and handle missing keys
+- **Solution**: Override both load_state_dict and from_pretrained methods to filter and handle missing keys
+- **Note**: This is the same approach used by DeepSpeed/TRL critics which use `strict=False` when loading
+- **Expected behavior**: value_head.weight will be missing from GPT checkpoints and randomly initialized
 
 ### 9.2 Virtual Pipeline Parallelism
 - **Issue**: Multiple model chunks may have post_process=True
