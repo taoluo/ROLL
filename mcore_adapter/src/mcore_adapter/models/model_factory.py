@@ -303,3 +303,177 @@ class McaGPTModel(GPTModel, PretrainedModel):
                 module_spec.submodules.input_layernorm = RMSNorm
                 module_spec.submodules.pre_mlp_layernorm = RMSNorm
             return module_spec
+
+
+class McaValueModel(GPTModel, PretrainedModel):
+    """
+    Megatron value model for critic training.
+    
+    Replaces the language modeling head with a value head that outputs
+    scalar values for each token position. Used in PPO and other RL algorithms
+    for value function estimation.
+    
+    Args:
+        config: McaModelConfig with model configuration
+        **kwargs: Additional arguments including pre_process and post_process flags
+    """
+    main_input_name: str = "input_ids"
+    config_class = McaModelConfig
+    
+    def __init__(self, config: "McaModelConfig", **kwargs):
+        """
+        Initialize value model with custom value head.
+        
+        Critical: Store pre/post process flags before super().__init__ 
+        as parent class pops them from kwargs.
+        """
+        # CRITICAL: Store and pop flags BEFORE super().__init__
+        self.pre_process = kwargs.pop("pre_process", mpu.is_pipeline_first_stage())
+        self.post_process = kwargs.pop("post_process", mpu.is_pipeline_last_stage())
+        
+        transformer_layer_spec = self._get_transformer_layer_spec(config)
+        super().__init__(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=config.padded_vocab_size,
+            max_sequence_length=config.max_sequence_length,
+            pre_process=self.pre_process,
+            post_process=self.post_process,
+            parallel_output=True,
+            share_embeddings_and_output_weights=config.tie_embeddings_and_output_weights,
+            position_embedding_type=config.position_embedding_type,
+            rotary_percent=config.rotary_percent,
+            rotary_base=config.rotary_base,
+            mtp_block_spec=kwargs.get("mtp_block_spec", None),
+        )
+        
+        # Replace language modeling head with value head for last pipeline stage
+        if self.post_process:
+            # Remove the default language modeling output layer
+            self.output_layer = None  # CRITICAL: Prevents vocab projection
+            
+            # Add value head: hidden_size → 1
+            self.value_head = torch.nn.Linear(
+                config.hidden_size, 1, bias=False, dtype=config.params_dtype
+            )
+            
+            # Initialize value head weights
+            if config.perform_initialization:
+                config.init_method(self.value_head.weight)
+            
+            # Set tensor parallel attributes for value head
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
+                self.value_head.weight
+            )
+        
+        for param in self.parameters():
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+        if not config.use_cpu_initialization:
+            self.cuda(torch.cuda.current_device())
+    
+    def forward(
+        self, 
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Forward pass through the value model.
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            position_ids: Position IDs for rotary embeddings
+            **kwargs: Additional arguments for special models (e.g., vision)
+            
+        Returns:
+            torch.Tensor: Value predictions [batch_size, seq_len, 1]
+        """
+        # Call parent forward to get hidden states
+        # Parent handles all pipeline parallel complexity
+        output = super().forward(input_ids, attention_mask, position_ids, **kwargs)
+        
+        # For intermediate pipeline stages, return hidden states as-is
+        if not self.post_process:
+            return output
+        
+        # For last pipeline stage, apply value head
+        # output is hidden states since we set output_layer=None
+        return self.value_head(output)  # Returns [batch, seq_len, 1]
+    
+    def state_dict_for_save_checkpoint(self) -> Dict[str, torch.Tensor]:
+        """
+        Override to include value_head weights in checkpoint.
+        
+        Returns:
+            Dict containing all model weights including value_head
+        """
+        # Get parent class state dict
+        state_dict = super().state_dict_for_save_checkpoint() if hasattr(super(), 'state_dict_for_save_checkpoint') else self.state_dict()
+        
+        # Ensure value_head weights are included
+        if self.post_process and hasattr(self, 'value_head'):
+            state_dict['value_head.weight'] = self.value_head.weight
+        
+        return state_dict
+    
+    def save_pretrained(self, save_directory: str, state_dict: Optional[Dict] = None, **kwargs):
+        """
+        Save model in HuggingFace format for compatibility with DeepSpeed backend.
+        
+        Args:
+            save_directory: Directory to save model
+            state_dict: Optional state dict to save
+            **kwargs: Additional save arguments
+        """
+        if state_dict is None:
+            state_dict = self.state_dict_for_save_checkpoint()
+        # Call parent's save_pretrained for HuggingFace compatibility
+        return super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)
+    
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
+        """
+        Override to handle missing value_head weights when loading from GPT checkpoints.
+        
+        Args:
+            state_dict: State dictionary to load
+            strict: Whether to strictly enforce matching keys
+            
+        Returns:
+            Tuple of (missing_keys, unexpected_keys)
+        """
+        # Filter out value_head from missing keys if loading from GPT checkpoint
+        missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False)
+        
+        # Only raise error if there are missing keys other than value_head
+        filtered_missing = [k for k in missing_keys if not k.startswith("value_head")]
+        
+        if strict and filtered_missing:
+            raise RuntimeError(f"Missing keys in state_dict: {filtered_missing}")
+        
+        return missing_keys, unexpected_keys
+    
+    def _get_transformer_layer_spec(self, config: Optional["McaModelConfig"]=None):
+        """Reuse the same transformer layer spec as McaGPTModel."""
+        config = config or self.config
+        use_te = config.transformer_impl == "transformer_engine"
+        if config.num_moe_experts:
+            transformer_block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)
+            if not use_te and config.normalization == "RMSNorm":
+                transformer_block_spec.layer_norm = RMSNorm
+            for transformer_layer_spec in transformer_block_spec.layer_specs:
+                if not use_te and config.normalization == "RMSNorm":
+                    transformer_layer_spec.submodules.input_layernorm = RMSNorm
+                    transformer_layer_spec.submodules.pre_mlp_layernorm = RMSNorm
+                if hasattr(transformer_layer_spec.submodules.mlp.submodules, "shared_experts"):
+                    transformer_layer_spec.submodules.mlp.submodules.shared_experts.params["gate"] = config.moe_use_shared_expert_gate
+            return transformer_block_spec
+        if use_te:
+            return get_gpt_layer_with_transformer_engine_spec(config.num_moe_experts, config.moe_grouped_gemm, qk_layernorm=config.qk_layernorm)
+        else:
+            module_spec = get_gpt_layer_local_spec(config.num_moe_experts, config.moe_grouped_gemm, qk_layernorm=config.qk_layernorm)
+            if config.normalization == "RMSNorm":
+                module_spec.submodules.input_layernorm = RMSNorm
+                module_spec.submodules.pre_mlp_layernorm = RMSNorm
+            return module_spec

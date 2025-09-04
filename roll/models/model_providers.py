@@ -509,7 +509,45 @@ def default_value_model_provider(
         and training_args is not None
         and isinstance(training_args, mca_TrainingArguments)
     ):
-        raise NotImplementedError("megatron value model not implemented")
+        # Megatron backend for value model
+        from mcore_adapter.models.auto.modeling_auto import AutoModel, get_model_cls
+        from mcore_adapter.models.model_factory import McaValueModel
+        
+        # Temporarily override get_model_cls to return McaValueModel for any model type
+        original_get_model_cls = get_model_cls
+        
+        def value_model_cls_override(model_type):
+            """Always return McaValueModel for value models."""
+            _ = model_type  # Not used, but required by interface
+            return McaValueModel
+        
+        # Monkey-patch the function in the module
+        import mcore_adapter.models.auto.modeling_auto as auto_module
+        auto_module.get_model_cls = value_model_cls_override
+        
+        try:
+            # Create value model using AutoModel.from_pretrained
+            # This will use VirtualModels wrapper and handle all Megatron complexity
+            model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
+            
+            # Set training/eval mode
+            if is_trainable:
+                model.train()
+                for param in model.parameters():
+                    param.requires_grad = True
+            else:
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad = False
+            
+            # Apply freezing and patching
+            freeze_model(model, model_args)
+            config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+            patch_model(model, config, use_mcore=True)
+            
+        finally:
+            # Restore original function
+            auto_module.get_model_cls = original_get_model_cls
     else:
         init_kwargs = {
             "torch_dtype": model_args.compute_dtype,

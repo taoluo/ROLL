@@ -176,7 +176,7 @@ class RLVRConfig(BaseConfig):
     kl_horizon: int = field(default=10000, metadata={"help": "Horizon for adaptive KL control"})
     use_reward_scaling: bool = field(default=False, metadata={"help": "Use reward scaling"})
     add_len_reward: bool = field(default=False)
-    reward_clip: float = field(default=None, metadata={"help": "reward clip value."})
+    reward_clip: Optional[float] = field(default=None, metadata={"help": "reward clip value."})
     difficulty_loss_weight: bool = field(default=False, metadata={"help": "Use difficulty_loss_weight"})
     length_loss_weight: bool = field(default=False, metadata={"help": "Use length_loss_weight"})
     use_reward_norm: bool = field(
