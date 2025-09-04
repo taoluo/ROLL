@@ -509,7 +509,7 @@ class RLVRPipeline(BasePipeline):
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+                        critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.c(batch, blocking=False)
 
                     with actor_train_timer:
                         # implement critic warmup

@@ -27,6 +27,34 @@ from .model_config import McaModelConfig
 from .model_utils import ModuleUtilsMixin, RMSNorm, exists_hf_config, exists_mca_config
 
 
+class ValueHeadWrapper(torch.nn.Module):
+    """Wrapper to adapt value_head to output_layer interface.
+    
+    The parent GPTModel.forward() expects output_layer to be callable with:
+    logits, bias = self.output_layer(hidden_states, weight=..., runtime_gather_output=...)
+    
+    This wrapper ignores the extra parameters and returns the expected tuple format.
+    """
+    
+    def __init__(self, value_head):
+        super().__init__()
+        self.value_head = value_head
+    
+    def forward(self, hidden_states, weight=None, runtime_gather_output=None):
+        """Forward pass matching output_layer interface.
+        
+        Args:
+            hidden_states: Hidden states from transformer [batch, seq_len, hidden_size]
+            weight: Optional weight for embedding sharing (ignored)
+            runtime_gather_output: Optional flag for parallel output (ignored)
+            
+        Returns:
+            Tuple of (values, None) where values has shape [batch, seq_len, 1]
+        """
+        values = self.value_head(hidden_states)
+        return values, None  # Return (logits, bias) tuple format
+
+
 if TYPE_CHECKING:
     from ..training_args import TrainingArguments
 
@@ -349,58 +377,29 @@ class McaValueModel(GPTModel, PretrainedModel):
         
         # Replace language modeling head with value head for last pipeline stage
         if self.post_process:
-            # Remove the default language modeling output layer
-            self.output_layer = None  # CRITICAL: Prevents vocab projection
-            
             # Add value head: hidden_size → 1
-            self.value_head = torch.nn.Linear(
+            value_head = torch.nn.Linear(
                 config.hidden_size, 1, bias=False, dtype=config.params_dtype
             )
             
             # Initialize value head weights
             if config.perform_initialization:
-                config.init_method(self.value_head.weight)
+                config.init_method(value_head.weight)
             
             # Set tensor parallel attributes for value head
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
-                self.value_head.weight
+                value_head.weight
             )
+            
+            # Create a module wrapper that matches output_layer interface
+            # This allows parent's forward() to work unchanged
+            self.output_layer = ValueHeadWrapper(value_head)
         
         for param in self.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
         if not config.use_cpu_initialization:
             self.cuda(torch.cuda.current_device())
     
-    def forward(
-        self, 
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        **kwargs
-    ) -> torch.Tensor:
-        """
-        Forward pass through the value model.
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
-            position_ids: Position IDs for rotary embeddings
-            **kwargs: Additional arguments for special models (e.g., vision)
-            
-        Returns:
-            torch.Tensor: Value predictions [batch_size, seq_len, 1]
-        """
-        # Call parent forward to get hidden states
-        # Parent handles all pipeline parallel complexity
-        output = super().forward(input_ids, attention_mask, position_ids, **kwargs)
-        
-        # For intermediate pipeline stages, return hidden states as-is
-        if not self.post_process:
-            return output
-        
-        # For last pipeline stage, apply value head
-        # output is hidden states since we set output_layer=None
-        return self.value_head(output)  # Returns [batch, seq_len, 1]
     
     def state_dict_for_save_checkpoint(self) -> Dict[str, torch.Tensor]:
         """
@@ -409,13 +408,11 @@ class McaValueModel(GPTModel, PretrainedModel):
         Returns:
             Dict containing all model weights including value_head
         """
-        # Get parent class state dict
+        # Get parent class state dict - this will include output_layer.value_head.weight
         state_dict = super().state_dict_for_save_checkpoint() if hasattr(super(), 'state_dict_for_save_checkpoint') else self.state_dict()
         
-        # Ensure value_head weights are included
-        if self.post_process and hasattr(self, 'value_head'):
-            state_dict['value_head.weight'] = self.value_head.weight
-        
+        # The value_head is now at output_layer.value_head.weight
+        # No need to add it separately as it's already included
         return state_dict
     
     def save_pretrained(self, save_directory: str, state_dict: Optional[Dict] = None, **kwargs):
@@ -447,7 +444,8 @@ class McaValueModel(GPTModel, PretrainedModel):
         missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False)
         
         # Only raise error if there are missing keys other than value_head
-        filtered_missing = [k for k in missing_keys if not k.startswith("value_head")]
+        # The value_head is now at output_layer.value_head.weight
+        filtered_missing = [k for k in missing_keys if not ("value_head" in k or "output_layer" in k)]
         
         if strict and filtered_missing:
             raise RuntimeError(f"Missing keys in state_dict: {filtered_missing}")
@@ -502,10 +500,10 @@ class McaValueModel(GPTModel, PretrainedModel):
             if unexpected_keys and config.tie_embeddings_and_output_weights:
                 unexpected_keys = [key for key in unexpected_keys if not key.endswith("output_layer.weight")]
             
-            # For McaValueModel, filter out expected missing value_head weights
+            # For McaValueModel, filter out expected missing value_head/output_layer weights
             if missing_keys:
-                value_head_missing = [key for key in missing_keys if "value_head" in key]
-                other_missing = [key for key in missing_keys if "value_head" not in key]
+                value_head_missing = [key for key in missing_keys if "value_head" in key or "output_layer" in key]
+                other_missing = [key for key in missing_keys if not ("value_head" in key or "output_layer" in key)]
                 if value_head_missing:
                     logger.info(f"Expected missing keys for value model (will be randomly initialized): {value_head_missing}")
                 missing_keys = other_missing  # Only check non-value_head missing keys
