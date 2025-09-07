@@ -2,6 +2,8 @@ import os
 import threading
 import time
 from typing import Union, Optional, Dict
+import json
+from datetime import datetime
 
 import ray
 import torch
@@ -392,6 +394,8 @@ class CriticWorker(Worker):
         super().__init__(worker_config=worker_config)
         self.tokenizer = None
         self.strategy: Optional[Union[InferenceStrategy, TrainStrategy]] = None
+        self.critic_log_file = None
+        self.critic_backend_type = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def initialize(self, pipeline_config):
@@ -406,7 +410,10 @@ class CriticWorker(Worker):
             load_dir = os.path.join(download_model(self.pipeline_config.resume_from_checkpoint), self.cluster_name)
             self.strategy.load_checkpoint(load_dir=load_dir, tag="checkpoint")
 
-        self.logger.info(f"{self.worker_name} initialized")
+        # Detect backend type and initialize logging
+        self._detect_backend_and_init_logging()
+
+        self.logger.info(f"{self.worker_name} initialized with {self.critic_backend_type} backend")
 
         self.strategy.offload_states()
 
@@ -431,6 +438,9 @@ class CriticWorker(Worker):
                 results: Dict[str, torch.Tensor] = self.strategy.forward_step(
                     batch=data, forward_func=self.forward_func_values
                 )
+
+            # Log critic outputs
+            self._log_critic_outputs(data, results, global_step)
 
             output = DataProto.from_dict(tensors={"values": results["values"]})
             data.to("cpu")
@@ -524,6 +534,112 @@ class CriticWorker(Worker):
         values = output_tensor[:, :-1]
         values = values.squeeze(dim=-1)
         return values, {"values": values.clone().detach()}
+
+    def _detect_backend_and_init_logging(self):
+        """Detect the backend type (Megatron or DeepSpeed) and initialize logging."""
+        # Check strategy name to determine backend
+        strategy_name = self.worker_config.strategy_args.strategy_name
+        
+        if "megatron" in strategy_name.lower():
+            self.critic_backend_type = "megatron"
+        elif "deepspeed" in strategy_name.lower():
+            self.critic_backend_type = "deepspeed"
+        else:
+            # Fallback: check model type
+            model = getattr(self.strategy, 'model', None)
+            if model is not None:
+                model_type = type(model).__name__
+                if "Mca" in model_type or "Megatron" in model_type:
+                    self.critic_backend_type = "megatron"
+                elif "DeepSpeed" in model_type or hasattr(model, 'v_head'):
+                    self.critic_backend_type = "deepspeed"
+                else:
+                    self.critic_backend_type = "unknown"
+            else:
+                self.critic_backend_type = strategy_name
+        
+        # Initialize log file
+        log_filename = f"critic_output_{self.critic_backend_type}.log"
+        self.critic_log_file = os.path.join(self.pipeline_config.output_dir, log_filename)
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(self.pipeline_config.output_dir, exist_ok=True)
+        
+        # Write header to log file
+        with open(self.critic_log_file, 'w') as f:
+            f.write(f"Critic Output Log - Backend: {self.critic_backend_type}\n")
+            f.write(f"Started at: {datetime.now().isoformat()}\n")
+            f.write(f"Strategy: {strategy_name}\n")
+            f.write(f"Worker: {self.worker_name}\n")
+            f.write("=" * 80 + "\n\n")
+
+    def _log_critic_outputs(self, data: DataProto, results: Dict[str, torch.Tensor], global_step: int):
+        """Log critic outputs to file for analysis."""
+        if self.critic_log_file is None:
+            return
+        
+        try:
+            values = results.get("values")
+            if values is None:
+                return
+            
+            # Convert BFloat16 to Float32 for numpy compatibility
+            if values.dtype == torch.bfloat16:
+                values_for_stats = values.float()
+            else:
+                values_for_stats = values
+            
+            # Prepare log entry
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "global_step": global_step,
+                "backend": self.critic_backend_type,
+                "values_shape": list(values.shape),
+                "values_dtype": str(values.dtype),
+                "values_device": str(values.device),
+                "values_stats": {
+                    "min": float(values_for_stats.min().item()),
+                    "max": float(values_for_stats.max().item()),
+                    "mean": float(values_for_stats.mean().item()),
+                    "std": float(values_for_stats.std().item()) if values.numel() > 1 else 0.0,
+                },
+                "batch_size": values.shape[0] if values.dim() > 0 else 1,
+                "sequence_length": values.shape[1] if values.dim() > 1 else 1,
+                "num_values_per_token": values.shape[-1] if values.dim() > 2 else 1,
+            }
+            
+            # Add sample values (first few tokens from first batch)
+            if values.numel() > 0:
+                # Convert to float32 for numpy if needed
+                sample_tensor = values[0, :min(10, values.shape[1])]
+                if sample_tensor.dtype == torch.bfloat16:
+                    sample_tensor = sample_tensor.float()
+                sample_values = sample_tensor.cpu().numpy().tolist()
+                log_entry["sample_values_first_10_tokens"] = sample_values
+            
+            # Add input information if available
+            if hasattr(data, 'tensors'):
+                input_ids = data.tensors.get("input_ids")
+                if input_ids is not None:
+                    log_entry["input_shape"] = list(input_ids.shape)
+                    log_entry["input_batch_size"] = input_ids.shape[0]
+                    log_entry["input_seq_length"] = input_ids.shape[1]
+            
+            # Write to log file
+            with open(self.critic_log_file, 'a') as f:
+                f.write(json.dumps(log_entry, indent=2))
+                f.write("\n" + "-" * 40 + "\n")
+            
+            # Also log summary to worker logger
+            self.logger.info(
+                f"Critic values logged - Step: {global_step}, "
+                f"Shape: {values.shape}, "
+                f"Mean: {values_for_stats.mean().item():.4f}, "
+                f"Std: {values_for_stats.std().item():.4f}"
+            )
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to log critic outputs: {e}")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def do_checkpoint(self, global_step):
