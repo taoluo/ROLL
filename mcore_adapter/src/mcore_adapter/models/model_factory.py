@@ -34,11 +34,14 @@ class ValueHeadWrapper(torch.nn.Module):
     logits, bias = self.output_layer(hidden_states, weight=..., runtime_gather_output=...)
     
     This wrapper ignores the extra parameters and returns the expected tuple format.
+    Includes dropout to match TRL's ValueHead implementation.
     """
     
-    def __init__(self, value_head):
+    def __init__(self, value_head, dropout_prob=0.1):
         super().__init__()
         self.value_head = value_head
+        # Match TRL's dropout behavior (default 0.1)
+        self.dropout = torch.nn.Dropout(dropout_prob) if dropout_prob else torch.nn.Identity()
     
     def forward(self, hidden_states, weight=None, runtime_gather_output=None):
         """Forward pass matching output_layer interface.
@@ -51,6 +54,8 @@ class ValueHeadWrapper(torch.nn.Module):
         Returns:
             Tuple of (values, None) where values has shape [batch, seq_len, 1]
         """
+        # Apply dropout before the linear layer (matching TRL)
+        hidden_states = self.dropout(hidden_states)
         values = self.value_head(hidden_states)
         return values, None  # Return (logits, bias) tuple format
 
@@ -378,22 +383,43 @@ class McaValueModel(GPTModel, PretrainedModel):
         # Replace language modeling head with value head for last pipeline stage
         if self.post_process:
             # Add value head: hidden_size → 1
+            # Match TRL/DeepSpeed: use bias=True (TRL default)
             value_head = torch.nn.Linear(
-                config.hidden_size, 1, bias=False, dtype=config.params_dtype
+                config.hidden_size, 1, bias=True, dtype=config.params_dtype
             )
             
-            # Initialize value head weights
+            # Initialize value head weights to match TRL/DeepSpeed behavior
+            # IMPORTANT: TRL's default (v_head_init_strategy=None) does NOT initialize weights
+            # This means PyTorch's default nn.Linear initialization is used:
+            # - Weights: uniform(-sqrt(1/fan_in), sqrt(1/fan_in)) 
+            # - Bias: uniform(-sqrt(1/fan_in), sqrt(1/fan_in)) - NOT zero!
             if config.perform_initialization:
-                config.init_method(value_head.weight)
+                # Match PyTorch's default Kaiming uniform initialization
+                import math
+                bound = math.sqrt(1.0 / config.hidden_size)
+                value_head.weight.data.uniform_(-bound, bound)
+                if value_head.bias is not None:
+                    # CRITICAL: PyTorch default does NOT zero the bias!
+                    # It uses the same uniform distribution as weights
+                    value_head.bias.data.uniform_(-bound, bound)
+                logger.info(f"Initialized value_head to match TRL default (PyTorch nn.Linear defaults)")
+                logger.info(f"Range: [{-bound:.6f}, {bound:.6f}] for both weights and bias")
+                logger.info(f"Bias value: {value_head.bias.data.item():.6f} (NOT zero!)")
+                logger.info(f"Sample weights: {value_head.weight.data.flatten()[:5].tolist()}")
             
             # Set tensor parallel attributes for value head
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
                 value_head.weight
             )
+            if value_head.bias is not None:
+                tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
+                    value_head.bias
+                )
             
             # Create a module wrapper that matches output_layer interface
             # This allows parent's forward() to work unchanged
-            self.output_layer = ValueHeadWrapper(value_head)
+            # Use dropout_prob=0.1 to match TRL's default
+            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=0.1)
         
         for param in self.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
@@ -444,7 +470,7 @@ class McaValueModel(GPTModel, PretrainedModel):
         missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False)
         
         # Only raise error if there are missing keys other than value_head
-        # The value_head is now at output_layer.value_head.weight
+        # The value_head is now at output_layer.value_head.weight and output_layer.value_head.bias
         filtered_missing = [k for k in missing_keys if not ("value_head" in k or "output_layer" in k)]
         
         if strict and filtered_missing:
