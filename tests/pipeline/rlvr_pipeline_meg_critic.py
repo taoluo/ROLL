@@ -425,12 +425,9 @@ class RLVRPipeline(BasePipeline):
                         batch.meta_info["disable_adapter"] = False
                     batch.meta_info["is_offload_states"] = False
                     if self.pipeline_config.adv_estimator == "gae":
-                        # When blocking=True, compute_values returns DataProto directly, not ObjectRefs
-                        values = self.critic.compute_values(batch, blocking=True)
-                        values_2 = self.critic2.compute_values(batch, blocking=True)
-                        # Store both values for later use in training
-                        batch.meta_info["values_critic1"] = values.batch["values"].clone()
-                        batch.meta_info["values_critic2"] = values_2.batch["values"].clone()
+                        # Use blocking=False to match original pipeline pattern
+                        values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
+                        values_refs_2: List[ray.ObjectRef] = self.critic2.compute_values(batch, blocking=False)
                     old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
                     old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
                     agg_entropy = agg_loss(
@@ -441,9 +438,53 @@ class RLVRPipeline(BasePipeline):
                     batch.meta_info["agg_entropy"] = agg_entropy
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        # values is already a DataProto, no need to materialize
-                        batch = batch.union(values)
-                        metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
+                        # Materialize values from both critics
+                        values_deepspeed = DataProto.materialize_concat(data_refs=values_refs)
+                        values_megatron = DataProto.materialize_concat(data_refs=values_refs_2)
+                        
+                        # Extract tensors for comparison
+                        values_ds_tensor = values_deepspeed.batch["values"]
+                        values_mg_tensor = values_megatron.batch["values"]
+                        
+                        # Verify shapes match
+                        assert values_ds_tensor.shape == values_mg_tensor.shape, \
+                            f"Shape mismatch: DeepSpeed {values_ds_tensor.shape} vs Megatron {values_mg_tensor.shape}"
+                        
+                        # Calculate comparison metrics
+                        abs_diff = torch.abs(values_ds_tensor - values_mg_tensor)
+                        rel_diff = abs_diff / (torch.abs(values_ds_tensor) + 1e-8)
+                        
+                        max_abs_diff = abs_diff.max().item()
+                        mean_abs_diff = abs_diff.mean().item()
+                        max_rel_diff = rel_diff.max().item()
+                        mean_rel_diff = rel_diff.mean().item()
+                        
+                        # Log comparison results
+                        logger.info(f"[Critic Equivalence Test] Step {global_step}")
+                        logger.info(f"  Max Absolute Diff: {max_abs_diff:.6e}")
+                        logger.info(f"  Mean Absolute Diff: {mean_abs_diff:.6e}")
+                        logger.info(f"  Max Relative Diff: {max_rel_diff:.4%}")
+                        logger.info(f"  Mean Relative Diff: {mean_rel_diff:.4%}")
+                        
+                        # Assert functional equivalence
+                        rtol = 1e-3  # 0.1% relative tolerance
+                        atol = 1e-4  # Small absolute tolerance
+                        
+                        is_close = torch.allclose(values_ds_tensor, values_mg_tensor, rtol=rtol, atol=atol)
+                        assert is_close, \
+                            f"Critic values not equivalent! Max abs: {max_abs_diff:.6e}, Max rel: {max_rel_diff:.4%}"
+                        
+                        logger.info(f"  ✓ Critics are functionally equivalent (rtol={rtol}, atol={atol})")
+                        
+                        # Store metrics for tracking
+                        metrics_mgr.add_metric("critic_test/max_abs_diff", max_abs_diff)
+                        metrics_mgr.add_metric("critic_test/mean_abs_diff", mean_abs_diff)
+                        metrics_mgr.add_metric("critic_test/max_rel_diff", max_rel_diff)
+                        metrics_mgr.add_metric("critic_test/mean_rel_diff", mean_rel_diff)
+                        
+                        # Use DeepSpeed values for training (as baseline)
+                        batch = batch.union(values_deepspeed)
+                        metrics_mgr.add_reduced_metrics(values_deepspeed.meta_info.pop("metrics", {}))
 
                     batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
                     metrics_mgr.add_reduced_metrics(old_log_probs.meta_info.pop("metrics", {}))

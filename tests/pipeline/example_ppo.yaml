@@ -64,14 +64,14 @@ loss_agg_mode: "seq-mean-token-sum"
 
 whiten_advantages: true
 advantage_clip: 2.0
-reward_clip: ~
+reward_clip: 10.0
 dual_clip_loss: true
 lambd: 0.95
 gamma: 1
 pg_clip: 0.2
-value_clip: ~
+value_clip: 10.0
 kl_penalty: "kl"
-target_kl: ~
+target_kl: 0.1
 init_kl_coef: 0.2
 kl_horizon: 10000
 add_token_level_kl: false
