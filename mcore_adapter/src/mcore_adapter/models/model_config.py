@@ -92,8 +92,10 @@ class PretrainedConfig:
 
     def update_with_args(self, args: "DistributingParallelArguments", verbose: bool = True):
         if args.additional_configs is not None:
+            logger.info(f"DEBUG: Processing additional_configs: {args.additional_configs}")
             for k, v in args.additional_configs.items():
                 if hasattr(self, k):
+                    logger.info(f"DEBUG: Setting {k}={v} on model config")
                     setattr(self, k, v)
                 else:
                     logger.warning(f"Config {k} is not found in model config, will not update it.")
@@ -174,6 +176,10 @@ class McaModelConfig(TransformerConfig, PretrainedConfig):
     tie_embeddings_and_output_weights: bool = field(
         default=False,
         metadata={"help": "Untie embeddings and output weights."},
+    )
+    use_value_head: bool = field(
+        default=False,
+        metadata={"help": "Replace language modeling head with value head for critic training."},
     )
     rotary_base: int = field(
         default=10000,

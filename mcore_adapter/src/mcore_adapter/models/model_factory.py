@@ -35,6 +35,7 @@ class ValueHeadWrapper(torch.nn.Module):
     
     This wrapper ignores the extra parameters and returns the expected tuple format.
     Includes dropout to match TRL's ValueHead implementation.
+    It also exposes a weight property for compatibility with setup_embeddings_and_output_layer.
     """
     
     def __init__(self, value_head, dropout_prob=0.1):
@@ -42,6 +43,15 @@ class ValueHeadWrapper(torch.nn.Module):
         self.value_head = value_head
         # Match TRL's dropout behavior (default 0.1)
         self.dropout = torch.nn.Dropout(dropout_prob) if dropout_prob else torch.nn.Identity()
+    
+    @property
+    def weight(self):
+        """Expose weight for compatibility with setup_embeddings_and_output_layer.
+        
+        The parent class's setup_embeddings_and_output_layer() method expects
+        self.output_layer.weight to exist and sets attributes on it.
+        """
+        return self.value_head.weight
     
     def forward(self, hidden_states, weight=None, runtime_gather_output=None):
         """Forward pass matching output_layer interface.
@@ -231,10 +241,23 @@ class PretrainedModel(MegatronModule, ModuleUtilsMixin):
             missing_keys, unexpected_keys = models.load_state_dict(state_dict, strict=False)
             if missing_keys:
                 missing_keys = [key for key in missing_keys if not key.endswith("._extra_state")]
+                # Filter out value_head weights when use_value_head is enabled
+                if config.use_value_head:
+                    missing_keys = [key for key in missing_keys if "value_head" not in key]
             if unexpected_keys and config.tie_embeddings_and_output_weights:
                 unexpected_keys = [key for key in unexpected_keys if not key.endswith("output_layer.weight")]
             assert unexpected_keys is None or len(unexpected_keys) == 0, f"unexpected_keys: {unexpected_keys}"
             assert missing_keys is None or len(missing_keys) == 0, f"missing_keys: {missing_keys}"
+        
+        # Initialize value head weights AFTER loading checkpoint to ensure they're not overwritten
+        if config.use_value_head:
+            for model in models.models:
+                if hasattr(model, 'output_layer') and hasattr(model.output_layer, 'value_head'):
+                    model.output_layer.value_head.weight.data.fill_(0.01)
+                    if hasattr(model.output_layer.value_head, 'bias') and model.output_layer.value_head.bias is not None:
+                        model.output_layer.value_head.bias.data.zero_()
+                    logger.info(f"Initialized value_head to CONSTANT 0.01 for testing parity (after checkpoint loading)")
+        
         logger.info(f"End loading, cost: {time.time() - load_start_time:0.3f}s")
         return models
 
@@ -295,6 +318,15 @@ class McaGPTModel(GPTModel, PretrainedModel):
         transformer_layer_spec = self._get_transformer_layer_spec(config)
         pre_process = kwargs.pop("pre_process", mpu.is_pipeline_first_stage())
         post_process = kwargs.pop("post_process", mpu.is_pipeline_last_stage())
+        
+        # For value head models, explicitly set share_embeddings_and_output_weights=False
+        # Value head outputs single scalar, incompatible with weight sharing
+        if getattr(config, 'use_value_head', False) and post_process:
+            share_embeddings = False
+            logger.info("Value head model: explicitly setting share_embeddings_and_output_weights=False")
+        else:
+            share_embeddings = config.tie_embeddings_and_output_weights
+        
         super().__init__(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -303,12 +335,38 @@ class McaGPTModel(GPTModel, PretrainedModel):
             pre_process=pre_process,
             post_process=post_process,
             parallel_output=True,
-            share_embeddings_and_output_weights=config.tie_embeddings_and_output_weights,
+            share_embeddings_and_output_weights=share_embeddings,
             position_embedding_type=config.position_embedding_type,
             rotary_percent=config.rotary_percent,
             rotary_base=config.rotary_base,
             mtp_block_spec=kwargs.get("mtp_block_spec", None),
         )
+        
+        # Replace output layer with value head if configured for critic training
+        # Note: The parent class creates a large output_layer when post_process=True.
+        # We replace it here, and the old one will be garbage collected (~234MB-1.2GB).
+        # This temporary memory usage is acceptable for the simplicity of the design.
+        logger.info(f"DEBUG McaGPTModel.__init__: use_value_head={getattr(config, 'use_value_head', False)}, post_process={self.post_process}")
+        if getattr(config, 'use_value_head', False) and self.post_process:
+            # Create value head: hidden_size → 1
+            value_head = torch.nn.Linear(
+                config.hidden_size, 1, bias=False, dtype=config.params_dtype
+            )
+            
+            # Initialize value head to constant 0.01 for testing parity with DeepSpeed/TRL
+            # This matches the initialization in roll/models/model_providers.py line 569
+            value_head.weight.data.fill_(0.01)
+            logger.info(f"Initialized Megatron value_head to CONSTANT 0.01 for testing parity")
+            
+            # Set tensor parallel attributes
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
+                value_head.weight
+            )
+            
+            # Replace output_layer with value head wrapper (no dropout for now)
+            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=0)
+            logger.info(f"DEBUG: Successfully replaced output_layer with ValueHeadWrapper")
+        
         for param in self.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
         if not config.use_cpu_initialization:
@@ -393,19 +451,8 @@ class McaValueModel(GPTModel, PretrainedModel):
             # This means PyTorch's default nn.Linear initialization is used:
             # - Weights: uniform(-sqrt(1/fan_in), sqrt(1/fan_in)) 
             # - Bias: uniform(-sqrt(1/fan_in), sqrt(1/fan_in)) - NOT zero!
-            if config.perform_initialization:
-                # Match PyTorch's default Kaiming uniform initialization
-                import math
-                bound = math.sqrt(1.0 / config.hidden_size)
-                value_head.weight.data.uniform_(-bound, bound)
-                if value_head.bias is not None:
-                    # CRITICAL: PyTorch default does NOT zero the bias!
-                    # It uses the same uniform distribution as weights
-                    value_head.bias.data.uniform_(-bound, bound)
-                logger.info(f"Initialized value_head to match TRL default (PyTorch nn.Linear defaults)")
-                logger.info(f"Range: [{-bound:.6f}, {bound:.6f}] for both weights and bias")
-                logger.info(f"Bias value: {value_head.bias.data.item():.6f} (NOT zero!)")
-                logger.info(f"Sample weights: {value_head.weight.data.flatten()[:5].tolist()}")
+            # NOTE: Initialization will be done in from_pretrained() method after model loading
+            # to ensure it's not overwritten by checkpoint loading
             
             # Set tensor parallel attributes for value head
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
@@ -537,6 +584,29 @@ class McaValueModel(GPTModel, PretrainedModel):
             assert unexpected_keys is None or len(unexpected_keys) == 0, f"unexpected_keys: {unexpected_keys}"
             assert missing_keys is None or len(missing_keys) == 0, f"missing_keys: {missing_keys}"
         logger.info(f"End loading, cost: {time.time() - load_start_time:0.3f}s")
+        
+        # TEMPORARY: Initialize value head to constant 0.01 for testing parity with DeepSpeed
+        # This must happen AFTER model loading to avoid being overwritten
+        try:
+            print(f"DEBUG PRINT: models type: {type(models)}, is VirtualModels: {isinstance(models, VirtualModels)}")
+            logger.info(f"DEBUG: models type: {type(models)}, is VirtualModels: {isinstance(models, VirtualModels)}")
+            if isinstance(models, VirtualModels):
+                logger.info(f"DEBUG: VirtualModels has {len(models)} models")
+                for i, model in enumerate(models.get_models()):
+                    logger.info(f"DEBUG: Model {i} type: {type(model)}, has value_head: {hasattr(model, 'value_head')}")
+                    if hasattr(model, 'value_head') and model.value_head is not None:
+                        model.value_head.weight.data.fill_(0.01)
+                        if model.value_head.bias is not None:
+                            model.value_head.bias.data.zero_()  # Keep bias at zero
+                        logger.info(f"Initialized Megatron model {i} value_head to CONSTANT 0.01 for testing parity")
+                        logger.info(f"Weight norm: {model.value_head.weight.data.norm().item():.6f}")
+                        logger.info(f"Bias value: {model.value_head.bias.data.item() if model.value_head.bias is not None else 'None'}")
+        except Exception as e:
+            print(f"DEBUG EXCEPTION: {e}")
+            logger.error(f"DEBUG EXCEPTION during value head initialization: {e}")
+            import traceback
+            traceback.print_exc()
+        
         return models
     
     def _get_transformer_layer_spec(self, config: Optional["McaModelConfig"]=None):

@@ -83,8 +83,10 @@ reward_scale: false
 # --------------------------
 # Below are detailed configurations for each role.
 
-pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
-reward_pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
+#pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
+#reward_pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
+pretrain: Qwen/Qwen2.5-0.5B-Instruct
+reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 
 validation:
   data_args:

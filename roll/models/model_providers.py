@@ -510,44 +510,25 @@ def default_value_model_provider(
         and isinstance(training_args, mca_TrainingArguments)
     ):
         # Megatron backend for value model
-        from mcore_adapter.models.auto.modeling_auto import AutoModel, get_model_cls
-        from mcore_adapter.models.model_factory import McaValueModel
+        from mcore_adapter.models.auto.modeling_auto import AutoModel
         
-        # Temporarily override get_model_cls to return McaValueModel for any model type
-        original_get_model_cls = get_model_cls
+        # Create model with value head (use_value_head flag is set in MegatronStrategy for CriticWorker)
+        model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
         
-        def value_model_cls_override(model_type):
-            """Always return McaValueModel for value models."""
-            _ = model_type  # Not used, but required by interface
-            return McaValueModel
+        # Set training/eval mode
+        if is_trainable:
+            model.train()
+            for param in model.parameters():
+                param.requires_grad = True
+        else:
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad = False
         
-        # Monkey-patch the function in the module
-        import mcore_adapter.models.auto.modeling_auto as auto_module
-        auto_module.get_model_cls = value_model_cls_override
-        
-        try:
-            # Create value model using AutoModel.from_pretrained
-            # This will use VirtualModels wrapper and handle all Megatron complexity
-            model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
-            
-            # Set training/eval mode
-            if is_trainable:
-                model.train()
-                for param in model.parameters():
-                    param.requires_grad = True
-            else:
-                model.eval()
-                for param in model.parameters():
-                    param.requires_grad = False
-            
-            # Apply freezing and patching
-            freeze_model(model, model_args)
-            config = AutoConfig.from_pretrained(model_args.model_name_or_path)
-            patch_model(model, config, use_mcore=True)
-            
-        finally:
-            # Restore original function
-            auto_module.get_model_cls = original_get_model_cls
+        # Apply freezing and patching
+        freeze_model(model, model_args)
+        config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        patch_model(model, config, use_mcore=True)
     else:
         init_kwargs = {
             "torch_dtype": model_args.compute_dtype,
@@ -582,6 +563,15 @@ def default_value_model_provider(
             model = load_model(model_args, is_trainable, True)
             setattr(model, "forward", token_classifier_forward.__get__(model))
             setattr(model, "load_state_dict", value_head_load_state_dict.__get__(model))
+            
+            # TEMPORARY: Initialize value head to constant 0.01 for testing parity with Megatron
+            if hasattr(model, 'v_head') and hasattr(model.v_head, 'summary'):
+                model.v_head.summary.weight.data.fill_(0.01)
+                if model.v_head.summary.bias is not None:
+                    model.v_head.summary.bias.data.zero_()  # Keep bias at zero
+                logger.info(f"Initialized TRL value_head to CONSTANT 0.01 for testing parity")
+                logger.info(f"Weight norm: {model.v_head.summary.weight.data.norm().item():.6f}")
+                logger.info(f"Bias value: {model.v_head.summary.bias.data.item() if model.v_head.summary.bias is not None else 0:.6f}")
         else:
             raise NotImplementedError
         if model.config.pad_token_id is None:

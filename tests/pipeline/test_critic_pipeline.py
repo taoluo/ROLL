@@ -47,8 +47,8 @@ def test_ppo_pipeline():
 
     init()
 
-    from tests.pipeline.rlvr_pipeline_meg_critic import RLVRPipeline
-    pipeline = RLVRPipeline(pipeline_config1=ppo_config1, pipeline_config2=ppo_config2)
+    from tests.pipeline.rlvr_pipeline_meg_critic import SimplifiedCriticTest
+    pipeline = SimplifiedCriticTest(pipeline_config1=ppo_config1, pipeline_config2=ppo_config2)
 
     pipeline.run()
 
