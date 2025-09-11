@@ -50,7 +50,7 @@ resume_from_checkpoint: false
 # --------------------------
 # ppo related
 
-rollout_batch_size: 16  # prompt - increased to be divisible by mini_batch_size after DP split
+rollout_batch_size: 128  # prompt - increased to be divisible by mini_batch_size after DP split
 prompt_length: 512
 response_length: 512
 
@@ -83,10 +83,10 @@ reward_scale: false
 # --------------------------
 # Below are detailed configurations for each role.
 
-#pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
-#reward_pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
-pretrain: Qwen/Qwen2.5-0.5B-Instruct
-reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
+pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
+reward_pretrain: Mxode/NanoLM-0.3B-Instruct-v1.1
+# pretrain: Qwen/Qwen2.5-0.5B-Instruct
+# reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 
 validation:
   data_args:

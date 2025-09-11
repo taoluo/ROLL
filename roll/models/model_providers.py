@@ -564,14 +564,17 @@ def default_value_model_provider(
             setattr(model, "forward", token_classifier_forward.__get__(model))
             setattr(model, "load_state_dict", value_head_load_state_dict.__get__(model))
             
-            # TEMPORARY: Initialize value head to constant 0.01 for testing parity with Megatron
-            if hasattr(model, 'v_head') and hasattr(model.v_head, 'summary'):
-                model.v_head.summary.weight.data.fill_(0.01)
+            # Initialize value head based on environment variable or default
+            init_value = float(os.environ.get('VALUE_HEAD_INIT', '0.0'))  # Default to 0.0 (random init)
+            if hasattr(model, 'v_head') and hasattr(model.v_head, 'summary') and init_value != 0.0:
+                model.v_head.summary.weight.data.fill_(init_value)
                 if model.v_head.summary.bias is not None:
                     model.v_head.summary.bias.data.zero_()  # Keep bias at zero
-                logger.info(f"Initialized TRL value_head to CONSTANT 0.01 for testing parity")
+                logger.info(f"Initialized TRL value_head to CONSTANT {init_value} (from VALUE_HEAD_INIT env var)")
                 logger.info(f"Weight norm: {model.v_head.summary.weight.data.norm().item():.6f}")
                 logger.info(f"Bias value: {model.v_head.summary.bias.data.item() if model.v_head.summary.bias is not None else 0:.6f}")
+            elif hasattr(model, 'v_head') and hasattr(model.v_head, 'summary'):
+                logger.info(f"Using default random initialization for TRL value_head")
         else:
             raise NotImplementedError
         if model.config.pad_token_id is None:

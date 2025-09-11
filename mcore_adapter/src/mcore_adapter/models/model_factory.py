@@ -250,13 +250,14 @@ class PretrainedModel(MegatronModule, ModuleUtilsMixin):
             assert missing_keys is None or len(missing_keys) == 0, f"missing_keys: {missing_keys}"
         
         # Initialize value head weights AFTER loading checkpoint to ensure they're not overwritten
-        if config.use_value_head:
+        init_value = float(os.environ.get('VALUE_HEAD_INIT', '0.0'))  # Default to 0.0 (no override)
+        if config.use_value_head and init_value != 0.0:
             for model in models.models:
                 if hasattr(model, 'output_layer') and hasattr(model.output_layer, 'value_head'):
-                    model.output_layer.value_head.weight.data.fill_(0.01)
+                    model.output_layer.value_head.weight.data.fill_(init_value)
                     if hasattr(model.output_layer.value_head, 'bias') and model.output_layer.value_head.bias is not None:
                         model.output_layer.value_head.bias.data.zero_()
-                    logger.info(f"Initialized value_head to CONSTANT 0.01 for testing parity (after checkpoint loading)")
+                    logger.info(f"Initialized value_head to CONSTANT {init_value} (after checkpoint loading, from VALUE_HEAD_INIT env var)")
         
         logger.info(f"End loading, cost: {time.time() - load_start_time:0.3f}s")
         return models
@@ -346,26 +347,35 @@ class McaGPTModel(GPTModel, PretrainedModel):
         # Note: The parent class creates a large output_layer when post_process=True.
         # We replace it here, and the old one will be garbage collected (~234MB-1.2GB).
         # This temporary memory usage is acceptable for the simplicity of the design.
-        logger.info(f"DEBUG McaGPTModel.__init__: use_value_head={getattr(config, 'use_value_head', False)}, post_process={self.post_process}")
         if getattr(config, 'use_value_head', False) and self.post_process:
             # Create value head: hidden_size → 1
             value_head = torch.nn.Linear(
                 config.hidden_size, 1, bias=False, dtype=config.params_dtype
             )
             
-            # Initialize value head to constant 0.01 for testing parity with DeepSpeed/TRL
-            # This matches the initialization in roll/models/model_providers.py line 569
-            value_head.weight.data.fill_(0.01)
-            logger.info(f"Initialized Megatron value_head to CONSTANT 0.01 for testing parity")
+            # Initialize value head based on environment variable or default
+            # This matches the initialization in roll/models/model_providers.py
+            init_value = float(os.environ.get('VALUE_HEAD_INIT', '0.0'))  # Default to 0.0 (random init)
+            if init_value != 0.0:
+                value_head.weight.data.fill_(init_value)
+                logger.info(f"Initialized Megatron value_head to CONSTANT {init_value} (from VALUE_HEAD_INIT env var)")
+            else:
+                logger.info(f"Using default random initialization for Megatron value_head")
             
             # Set tensor parallel attributes
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
                 value_head.weight
             )
             
-            # Replace output_layer with value head wrapper (no dropout for now)
-            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=0)
-            logger.info(f"DEBUG: Successfully replaced output_layer with ValueHeadWrapper")
+            # Replace output_layer with value head wrapper
+            # Dropout probability controlled by environment variable
+            dropout_prob = float(os.environ.get('CRITIC_DROPOUT_PROB', '0.0'))  # Default to 0.0 (no dropout)
+            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=dropout_prob)
+            if dropout_prob > 0:
+                logger.info(f"Using dropout probability {dropout_prob} for value head (from CRITIC_DROPOUT_PROB env var)")
+            else:
+                logger.info(f"No dropout for value head (CRITIC_DROPOUT_PROB not set or 0.0)")
+            logger.info(f"Successfully replaced output_layer with ValueHeadWrapper for critic")
         
         for param in self.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
@@ -465,8 +475,13 @@ class McaValueModel(GPTModel, PretrainedModel):
             
             # Create a module wrapper that matches output_layer interface
             # This allows parent's forward() to work unchanged
-            # Use dropout_prob=0.1 to match TRL's default
-            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=0.1)
+            # Dropout probability controlled by environment variable
+            dropout_prob = float(os.environ.get('CRITIC_DROPOUT_PROB', '0.1'))  # Default to 0.1 to match TRL
+            self.output_layer = ValueHeadWrapper(value_head, dropout_prob=dropout_prob)
+            if dropout_prob != 0.1:
+                logger.info(f"Using dropout probability {dropout_prob} for value head (from CRITIC_DROPOUT_PROB env var)")
+            else:
+                logger.info(f"Using default dropout probability 0.1 for value head")
         
         for param in self.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
@@ -595,12 +610,14 @@ class McaValueModel(GPTModel, PretrainedModel):
                 for i, model in enumerate(models.get_models()):
                     logger.info(f"DEBUG: Model {i} type: {type(model)}, has value_head: {hasattr(model, 'value_head')}")
                     if hasattr(model, 'value_head') and model.value_head is not None:
-                        model.value_head.weight.data.fill_(0.01)
-                        if model.value_head.bias is not None:
-                            model.value_head.bias.data.zero_()  # Keep bias at zero
-                        logger.info(f"Initialized Megatron model {i} value_head to CONSTANT 0.01 for testing parity")
-                        logger.info(f"Weight norm: {model.value_head.weight.data.norm().item():.6f}")
-                        logger.info(f"Bias value: {model.value_head.bias.data.item() if model.value_head.bias is not None else 'None'}")
+                        init_value = float(os.environ.get('VALUE_HEAD_INIT', '0.0'))  # Default to 0.0 (no override)
+                        if init_value != 0.0:
+                            model.value_head.weight.data.fill_(init_value)
+                            if model.value_head.bias is not None:
+                                model.value_head.bias.data.zero_()  # Keep bias at zero
+                            logger.info(f"Initialized Megatron model {i} value_head to CONSTANT {init_value} (from VALUE_HEAD_INIT env var)")
+                            logger.info(f"Weight norm: {model.value_head.weight.data.norm().item():.6f}")
+                            logger.info(f"Bias value: {model.value_head.bias.data.item() if model.value_head.bias is not None else 'None'}")
         except Exception as e:
             print(f"DEBUG EXCEPTION: {e}")
             logger.error(f"DEBUG EXCEPTION during value head initialization: {e}")

@@ -470,11 +470,16 @@ class CriticWorker(Worker):
                 per_device_train_batch_size * self.worker_config.training_args.gradient_accumulation_steps
             )
 
+            # Control data shuffling via environment variable
+            shuffle_data = bool(int(os.environ.get('CRITIC_DATA_SHUFFLE', '1')))  # Default to True (1)
+            if not shuffle_data:
+                self.logger.info("Data shuffling DISABLED for critic training (CRITIC_DATA_SHUFFLE=0)")
+            
             dataloader = data.make_iterator(
                 mini_batch_size=backward_batch_size,
                 epochs=1,
                 seed=self.pipeline_config.seed,
-                dataloader_kwargs={"shuffle": True},
+                dataloader_kwargs={"shuffle": shuffle_data},
             )
 
             for batch_idx, data in tqdm(

@@ -47,8 +47,9 @@ def test_ppo_pipeline():
 
     init()
 
-    from tests.pipeline.rlvr_pipeline_meg_critic import SimplifiedCriticTest
-    pipeline = SimplifiedCriticTest(pipeline_config1=ppo_config1, pipeline_config2=ppo_config2)
+    from tests.critic_parity.critic_parity_pipeline import CriticParityPipeline
+    # Set use_mock_data=True to test with mock data only
+    pipeline = CriticParityPipeline(pipeline_config1=ppo_config1, pipeline_config2=ppo_config2, use_mock_data=False)
 
     pipeline.run()
 
